@@ -1,142 +1,67 @@
-# Task 001: Configure + Work Application Shell
+# Task 001: Build the End-to-End MVP
 
-## Goal
+## Objective
 
-Create the first runnable application vertical slice that proves the user experience and domain semantics without implementing model inference.
+Take the current Agentic Harness concept and build the first coherent, usable end-to-end version of the software.
 
-## Scope
+Do not stop at a UI mockup or architecture scaffold. The goal is to make the concept real enough that the full loop can be exercised locally.
 
-Build a local desktop-oriented frontend with two top-level views:
+## Product concept
 
-### Work
+The application is a local-first visual agent orchestration environment with two views:
 
-A minimal AI chat/work shell containing:
+- **Work**: a familiar AI chat/work interface.
+- **Configure**: a visual capability-topology editor.
 
-- conversation area,
-- user input composer,
-- send button,
-- placeholder assistant response behavior only,
-- clear indication that inference is not yet connected.
+The Configure graph defines which agents can access which models, tools, skills, MCP/API/connector resources, storage systems, and other agents. Edges are permissions/capabilities/relationships, not prescribed execution order.
 
-Do not integrate an LLM in this task.
+Agents are specialized workers that communicate through structured work orders. Models and agents are separate concepts so custom user-trained models can be swapped and reused.
 
-### Configure
+The runtime should be designed for consumer hardware, including machines around 16 GB RAM / 8 GB VRAM, by loading models only when needed, unloading idle models, queuing work, and allowing sequential operation when concurrency is not practical.
 
-Build a node-based editor using React + TypeScript and `@xyflow/react`.
+## Required MVP capabilities
 
-The initial canvas must support these node categories:
+Build enough of the system that a user can:
 
-1. Model
-2. Agent
-3. Capability
-4. Skill
-5. Connector
-6. Storage
+- install and run the application locally;
+- switch between Work and Configure;
+- create, edit, connect, save, and reload a capability topology;
+- represent Models, Agents, Tools/Capabilities, Skills, MCP/API/Connector resources, and Storage;
+- define typed A2A relationships such as delegate, consult, review, report, and handoff;
+- enforce hard topology boundaries so disconnected capabilities are unavailable;
+- configure an agent with a model and permitted resources;
+- connect at least one practical local inference path;
+- send a task from Work into the configured system;
+- create and route structured work orders;
+- execute at least a basic orchestrator-to-specialist flow;
+- persist useful task state and outputs;
+- demonstrate model lifecycle/resource handling appropriate to local hardware;
+- inspect runtime state sufficiently to understand what the system is doing;
+- pause/resume work in a way that preserves completed state;
+- document how to run, configure, and extend the MVP.
 
-Use clearly distinct visual treatments for each category. Exact final branding is not required.
+Use the simplest robust implementation that proves the complete concept. It is acceptable for some integrations or advanced options to remain extensible rather than exhaustive, but the main user journey must actually work.
 
-## Critical graph rule
+## Reuse existing work
 
-Edges represent **availability/permission**, not execution flow.
+Before reinventing infrastructure, study and use established open-source projects where appropriate:
 
-Do not implement automatic DAG execution.
+- https://github.com/langflow-ai/langflow
+- https://github.com/xyflow/xyflow
+- https://github.com/ggml-org/llama.cpp
+- https://github.com/mostlygeek/llama-swap
+- https://github.com/open-webui/open-webui
 
-## Required interactions
+Also use existing MCP/A2A standards and libraries where they fit.
 
-- Add node from a simple palette.
-- Drag/reposition nodes.
-- Connect compatible nodes.
-- Delete nodes and edges.
-- Select a node and edit basic metadata in an inspector panel.
-- Switch between Configure and Work without losing graph state.
-- Save/load graph state locally using a simple temporary persistence mechanism suitable for the prototype.
+Respect all licenses and attribution requirements.
 
-## Initial typed domain model
+## Working style
 
-Create explicit TypeScript types for node and edge domain data rather than storing arbitrary UI-only objects.
+Drive this task to completion without pausing after every subsystem.
 
-Suggested node kinds:
+Make reasonable architecture and implementation decisions yourself. Research dependencies as needed. Add tests and documentation as the product develops. If one approach proves unsuitable, adjust and continue.
 
-```ts
-type NodeKind =
-  | 'model'
-  | 'agent'
-  | 'capability'
-  | 'skill'
-  | 'connector'
-  | 'storage';
-```
+Only ask for user input when a genuine blocker cannot be resolved responsibly from the repository context, available open-source references, or sound engineering judgment.
 
-Suggested relationship kinds should include at least:
-
-```ts
-type RelationshipKind =
-  | 'uses_model'
-  | 'can_use'
-  | 'can_access'
-  | 'delegate'
-  | 'consult'
-  | 'review'
-  | 'report'
-  | 'handoff';
-```
-
-The implementation may refine names, but preserve these semantics.
-
-## Validation rules for the prototype
-
-At minimum:
-
-- Agent -> Model may use `uses_model`.
-- Agent -> Capability/Skill/Connector may use `can_use`.
-- Agent -> Storage may use `can_access`.
-- Agent -> Agent may use one of the defined A2A relationship types.
-- Invalid connection categories should be rejected or clearly flagged.
-
-Do not over-engineer permissions yet.
-
-## Recommended initial stack
-
-Use:
-
-- React
-- TypeScript
-- Vite
-- `@xyflow/react`
-
-A Tauri 2 shell is acceptable and preferred if it does not materially slow the task. If Tauri setup becomes the dominant work, keep the first implementation browser-runnable and document the packaging follow-up instead.
-
-Do not add Electron.
-
-## Explicit non-goals
-
-Do not implement:
-
-- LLM inference,
-- custom model loading,
-- llama.cpp/Ollama/LM Studio/vLLM integration,
-- training/fine-tuning,
-- MCP runtime,
-- A2A network transport,
-- vector databases,
-- scheduler/model residency logic,
-- GPU telemetry,
-- automatic topology optimization,
-- autonomous graph modification.
-
-## Acceptance criteria
-
-1. Project runs locally with documented commands.
-2. User can switch between Work and Configure views.
-3. Configure view presents a usable node canvas.
-4. All six initial node categories can be created.
-5. Supported relationship types are represented in typed application state.
-6. Invalid basic node relationships cannot silently create valid-looking edges.
-7. Graph state survives view switching and can be saved/reloaded locally.
-8. No edge is interpreted as sequential execution.
-9. README contains setup/run instructions.
-10. Basic tests cover connection validation/domain rules.
-
-## Deliverable
-
-Open a focused PR for Task 001 only. Include screenshots of both views in the PR description if practical.
+The definition of done is a coherent local MVP demonstrating the full concept, not merely a completed checklist of isolated components.
