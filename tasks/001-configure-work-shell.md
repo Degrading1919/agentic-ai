@@ -65,3 +65,7 @@ Make reasonable architecture and implementation decisions yourself. Research dep
 Only ask for user input when a genuine blocker cannot be resolved responsibly from the repository context, available open-source references, or sound engineering judgment.
 
 The definition of done is a coherent local MVP demonstrating the full concept, not merely a completed checklist of isolated components.
+
+## Implementation status
+
+Completed on 2026-09-22. The repository now includes the visual Configure editor, Work console, durable local runtime, structured orchestrator-to-specialist execution, topology enforcement, model lifecycle scheduling, pause/resume support, tests, and local-inference documentation described above. The deterministic mock provider keeps the full flow runnable without external services; an OpenAI-compatible provider and llama-swap lifecycle hooks support practical local models.

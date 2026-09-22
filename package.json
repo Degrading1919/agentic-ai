@@ -1,0 +1,44 @@
+{
+  "name": "agentic-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first visual orchestration for teams of specialized AI workers.",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c magenta,cyan \"pnpm dev:server\" \"pnpm dev:web\"",
+    "dev:server": "tsx watch src/server/index.ts",
+    "dev:web": "vite",
+    "build": "pnpm build:web && pnpm build:server",
+    "build:web": "vite build",
+    "build:server": "tsup src/server/index.ts --format esm --platform node --target node22 --out-dir dist/server --clean --sourcemap",
+    "start": "node dist/server/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@fastify/static": "^10.1.4",
+    "@xyflow/react": "^12.11.6",
+    "fastify": "^5.12.5",
+    "lucide-react": "^1.47.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "tsx": "^4.23.15",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  }
+}
