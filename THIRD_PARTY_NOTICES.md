@@ -13,6 +13,7 @@ Direct runtime dependencies include:
 | Lucide | Interface icons | ISC |
 | react-markdown | Safe Markdown rendering | MIT |
 | MCP TypeScript SDK (`@modelcontextprotocol/sdk`) | MCP client (stdio, Streamable HTTP) and the test fixture server | MIT |
+| cross-spawn | Cross-platform process spawning for the bounded MCP stdio transport | MIT |
 
 Development dependencies include Vite, Vitest, TypeScript, tsx, tsup, and concurrently under their respective open-source licenses.
 

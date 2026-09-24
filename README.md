@@ -141,7 +141,9 @@ pnpm test
 pnpm build
 ```
 
-The suite (61 tests) covers topology validity, stable-prefix determinism, deferred exposure at 150 tools, context packing and budget errors, storage scope and symlink enforcement, BM25 memory, HTTP boundary checks, the MCP client over stdio and Streamable HTTP against a real SDK server, an end-to-end deferred MCP run, every relationship semantic (selective delegation, review/revision, handoff, inline consult, reports), thread continuation with memory, pause/resume/restart, scheduler slots and budgets, GGUF parsing, llama-swap config generation, GPU telemetry parsing, and migration of MVP state.
+The suite (123 tests) covers topology validity, stable-prefix determinism, deferred exposure at 150 tools, context packing and per-call tool-loop fitting on small windows, storage containment against drive-qualified, UNC, and device scopes and Windows junctions, transactional state writes under injected failures, the artifact information-flow policy, fail-closed reviews and review after handoff, effect recovery from crash images against a real HTTP service (non-idempotent reconciliation, idempotent retry keys, checkpoint non-replay), pause as a quiescence barrier, MCP credential rotation, definition drift, TTL expiry and hostile payload limits on live SDK servers, residency re-accounting and VRAM estimation, every relationship semantic, thread continuation, GGUF parsing, llama-swap config generation, GPU telemetry parsing, and migration of earlier state.
+
+The [2026-09-24 audit remediation report](docs/audits/2026-09-24-sol-high-remediation.md) maps each audit finding to its fix and regression tests.
 
 ## Architecture
 
@@ -174,9 +176,19 @@ The scheduler, not an LLM, owns queueing, legality checks, context assembly, mod
 - Node and edge schemas: `src/shared/contracts.ts`; edge legality: `src/shared/topology.ts`.
 - Context segments and prompt order: `src/shared/prompt.ts` and `src/server/context-builder.ts`.
 
+## Safety and recovery
+
+- **Filesystem scopes** never follow links or junctions and reject drive-qualified, UNC, device, and traversal paths.
+- **Artifacts** are readable only through work-order relationships (dependency, subject, child, revision, handoff, own tool results, root-chain thread history).
+- **External effects** are recorded in a durable ledger. After a crash or pause, retry-safe calls repeat with the same operation ID (`Idempotency-Key`); others pause the run until a human records whether they took effect. Nothing is blindly replayed.
+- **Pause** returns once no model call or tool effect is in flight.
+- **Reviews** fail closed: malformed or missing verdicts mark results unreviewed, never approved.
+- **MCP trust** is local: read-only and retry-safe decisions are pinned to tool definitions, catalogs are re-verified per credential and TTL, and untrusted payloads are size-bounded.
+
 ## Current limits
 
-- Pre-request token counts are estimates; server-reported usage is recorded alongside them.
+- Pre-request token counts are estimates; server-reported usage is recorded alongside them, and cache hits are shown only when the server reports them.
+- Idempotent effects are at-least-once under a stable key and effectful ones at-most-once with human reconciliation; exactly-once is not claimed. A local process that swaps storage directories for links during an operation is outside the storage threat model.
 - GPU telemetry is NVIDIA-only. `vector-store` has no adapter yet (use `memory`); `git` storage reads and writes files without committing.
 - MCP support covers tools (not resources, prompts, or OAuth). A2A is implemented in-process; no cross-process A2A transport yet.
 - The store is a single JSON document for a single process.

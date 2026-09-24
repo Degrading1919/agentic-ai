@@ -19,6 +19,8 @@ Deferred loading returns schemas as tool results and dispatches through `call_to
 
 Every invocation is re-authorized against the current saved topology immediately before execution, independent of exposure.
 
+**Amendment (audit A5).** For MCP tools, authorization for *read-only* work and the retry-safety of a call come from locally owned `trustPolicies` pinned to each tool's definition hash, never from server annotations. A catalog must be verified in the current process for the current credential identity (within `catalogTtlMs`) before its tools are exposed, and a call is refused if the tool's verified definition differs from the one the worker was shown.
+
 ## Consequences
 
 - The topology is simultaneously a security, hallucination, and context-budget boundary.

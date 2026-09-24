@@ -61,7 +61,9 @@ weights (file size) + f16 KV cache for the node's context window + ~256 MB overh
 KV cache = 2 × layers × context × kv_heads × head_dim × 2 bytes
 ```
 
-Grouped-query attention (`head_count_kv`) is taken into account. The estimate becomes the node's **Est. RAM MB**. Set **Est. VRAM MB** by hand to match your `-ngl` offload.
+Grouped-query attention (`head_count_kv`) is taken into account. The inspection uses the node's GPU layers and parallel slots: offloaded layers' weights and KV cache count as VRAM (plus a compute buffer), the rest as host RAM. GPU layers `-1` (server default) is treated as full offload, the conservative assumption for VRAM. The KV cache covers window × parallel slots. Both **Est. RAM MB** and **Est. VRAM MB** are filled, and the assumptions are shown.
+
+Leave **Est. VRAM MB** empty when you do not know it: the scheduler then reserves the whole VRAM budget for that model rather than assuming it needs none. Enter `0` only for CPU-only models.
 
 ## Generate a llama-swap config
 
@@ -75,11 +77,11 @@ models:
     ttl: 120
 ```
 
-The command uses the node's context window, parallel slots, alias, GPU layers, and adapters; `ttl` comes from the idle TTL. Start llama-swap with it and point the Model nodes at llama-swap's `/v1` URL.
+The command uses the node's context window, parallel slots, alias, GPU layers, and adapters; `ttl` comes from the idle TTL. Because llama-server divides `-c` among `--parallel` slots, `-c` is the window multiplied by the slot count so that every slot gets the node's full window. Start llama-swap with it and point the Model nodes at llama-swap's `/v1` URL.
 
 ## Parallel slots and concurrency
 
-Set **Parallel slots** to match llama.cpp's `--parallel`. The scheduler sends up to that many concurrent requests to one model and queues the rest. Independent work orders that use different models run concurrently only when both fit the RAM and VRAM budgets; otherwise they run one after another with idle models evicted in between. `AGENTIC_HARNESS_MAX_PARALLEL_ORDERS` caps overlap per run.
+Set **Parallel slots** to match llama.cpp's `--parallel`. Saving a changed model re-accounts its residency immediately when it is idle (for llama-swap, the previously loaded model is unloaded), or as soon as its in-flight requests finish. The scheduler sends up to that many concurrent requests to one model and queues the rest. Independent work orders that use different models run concurrently only when both fit the RAM and VRAM budgets; otherwise they run one after another with idle models evicted in between. `AGENTIC_HARNESS_MAX_PARALLEL_ORDERS` caps overlap per run.
 
 ## Prompt caching
 
