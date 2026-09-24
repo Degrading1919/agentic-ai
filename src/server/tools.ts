@@ -1,35 +1,7 @@
-import type {
-  AgentNode,
-  CapabilityNode,
-  ToolCall,
-  ToolDefinition,
-} from "../shared/contracts.js";
-
-const calculatorDefinition: ToolDefinition = {
-  type: "function",
-  function: {
-    name: "calculator_evaluate",
-    description:
-      "Evaluate a finite arithmetic expression containing numbers, parentheses, +, -, *, /, %, and ^.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        expression: { type: "string", minLength: 1, maxLength: 200 },
-      },
-      required: ["expression"],
-    },
-  },
-};
-
-export function toolDefinitions(capabilities: CapabilityNode[]): ToolDefinition[] {
-  return capabilities.flatMap((capability) => {
-    if (!capability.config.enabled) return [];
-    if (capability.config.capabilityId === "calculator") return [calculatorDefinition];
-    return [];
-  });
-}
-
+/**
+ * Safe arithmetic for the built-in calculator capability. A small
+ * recursive-descent parser; it never evaluates JavaScript.
+ */
 class ArithmeticParser {
   private index = 0;
 
@@ -120,35 +92,4 @@ class ArithmeticParser {
 
 export function evaluateArithmetic(expression: string): number {
   return new ArithmeticParser(expression).parse();
-}
-
-export function executeToolCall(
-  agent: AgentNode,
-  capabilities: CapabilityNode[],
-  call: ToolCall,
-): string {
-  if (call.function.name !== "calculator_evaluate") {
-    throw new Error(`Tool '${call.function.name}' is not implemented.`);
-  }
-  const allowed = capabilities.some(
-    (capability) =>
-      capability.config.enabled && capability.config.capabilityId === "calculator",
-  );
-  if (!allowed) {
-    throw new Error(
-      `Topology boundary denied '${call.function.name}' for agent '${agent.name}'.`,
-    );
-  }
-  let payload: unknown;
-  try {
-    payload = JSON.parse(call.function.arguments);
-  } catch {
-    throw new Error("Calculator arguments were not valid JSON.");
-  }
-  const expression =
-    typeof payload === "object" && payload !== null && "expression" in payload
-      ? String(payload.expression)
-      : "";
-  if (!expression) throw new Error("Calculator requires an expression.");
-  return String(evaluateArithmetic(expression));
 }

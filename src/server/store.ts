@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AppState, Run, Topology } from "../shared/contracts.js";
+import type { AppState, ConnectorCatalog, Run, Topology } from "../shared/contracts.js";
 import { appStateSchema } from "../shared/contracts.js";
 import { createDemoTopology } from "../shared/demo-topology.js";
 
@@ -44,6 +44,7 @@ export class LocalStore {
         activeTopologyId: topology.id,
         topologies: [topology],
         runs: [],
+        connectorCatalogs: [],
       };
       await this.persist();
     }
@@ -79,6 +80,25 @@ export class LocalStore {
 
   snapshot(): AppState {
     return clone(this.requireState());
+  }
+
+  /** Resolves once every queued mutation has been persisted. */
+  async flush(): Promise<void> {
+    await this.writeChain;
+  }
+
+  listCatalogs(): ConnectorCatalog[] {
+    return clone(this.requireState().connectorCatalogs);
+  }
+
+  async saveCatalog(catalog: ConnectorCatalog): Promise<ConnectorCatalog> {
+    return this.enqueueMutation((state) => {
+      state.connectorCatalogs = [
+        ...state.connectorCatalogs.filter((item) => item.connectorId !== catalog.connectorId),
+        clone(catalog),
+      ];
+      return catalog;
+    });
   }
 
   listTopologies(): Topology[] {

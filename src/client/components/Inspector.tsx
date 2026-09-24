@@ -146,7 +146,7 @@ function NodeInspector({
         {node.kind === "capability" && (
           <><Field label="Built-in capability"><select value={node.config.capabilityId} disabled><option value="calculator">Safe calculator</option></select></Field><Toggle label="Enabled" checked={node.config.enabled} onChange={(enabled) => onUpdate({ ...node, config: { ...node.config, enabled } })} /></>
         )}
-        {node.kind === "skill" && <Field label="Skill instructions"><textarea rows={9} value={node.config.instructions} onChange={(event) => onUpdate({ ...node, config: { instructions: event.target.value } })} /></Field>}
+        {node.kind === "skill" && <Field label="Skill instructions"><textarea rows={9} value={node.config.instructions} onChange={(event) => onUpdate({ ...node, config: { ...node.config, instructions: event.target.value } })} /></Field>}
         {node.kind === "connector" && (
           <><Field label="Connector type"><select value={node.config.connectorType} onChange={(event) => onUpdate({ ...node, config: { ...node.config, connectorType: event.target.value as "mcp" | "http-api" } })}><option value="mcp">MCP</option><option value="http-api">HTTP API</option></select></Field><Field label="Endpoint"><input value={node.config.endpoint} onChange={(event) => onUpdate({ ...node, config: { ...node.config, endpoint: event.target.value } })} /></Field><Field label="Auth environment variable"><input value={node.config.authEnv} onChange={(event) => onUpdate({ ...node, config: { ...node.config, authEnv: event.target.value } })} /></Field><Toggle label="Enabled" checked={node.config.enabled} onChange={(enabled) => onUpdate({ ...node, config: { ...node.config, enabled } })} /></>
         )}

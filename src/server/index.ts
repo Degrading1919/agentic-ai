@@ -2,13 +2,18 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
-import { ZodError } from "zod";
+import { ZodError, z } from "zod";
+import { connectorFingerprint } from "../shared/capabilities.js";
 import {
   createRunRequestSchema,
   topologySchema,
+  type ConnectorNode,
   type ModelNode,
 } from "../shared/contracts.js";
+import { estimateAgentFootprint } from "../shared/prompt.js";
 import { validateTopology } from "../shared/topology.js";
+import { inspectGguf } from "./gguf.js";
+import { generateLlamaSwapConfig } from "./llama-swap.js";
 import { testModelConnection } from "./providers.js";
 import { RuntimeEngine } from "./runtime.js";
 import { LocalStore } from "./store.js";
@@ -101,6 +106,64 @@ app.post<{ Params: { runId: string } }>("/api/runs/:runId/resume", async (reques
 }));
 
 app.get("/api/runtime", async () => ({ runtime: runtime.snapshot() }));
+
+app.get("/api/catalogs", async () => ({ catalogs: store.listCatalogs() }));
+
+app.post<{ Params: { topologyId: string; connectorId: string } }>(
+  "/api/topologies/:topologyId/connectors/:connectorId/discover",
+  async (request, reply) => {
+    const topology = store.getTopology(request.params.topologyId);
+    const connector = topology?.nodes.find(
+      (node): node is ConnectorNode => node.id === request.params.connectorId && node.kind === "connector",
+    );
+    if (!topology || !connector) return reply.status(404).send({ error: "Connector not found" });
+    try {
+      return { catalog: await runtime.discoverConnector(topology.id, connector.id) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const catalog = await store.saveCatalog({
+        connectorId: connector.id,
+        fingerprint: connectorFingerprint(connector),
+        fetchedAt: new Date().toISOString(),
+        serverName: "",
+        serverVersion: "",
+        tools: [],
+        error: message,
+      });
+      return reply.status(502).send({ error: message, catalog });
+    }
+  },
+);
+
+app.get<{ Params: { topologyId: string } }>(
+  "/api/topologies/:topologyId/footprint",
+  async (request, reply) => {
+    const topology = store.getTopology(request.params.topologyId);
+    if (!topology) return reply.status(404).send({ error: "Topology not found" });
+    const catalogs = store.listCatalogs();
+    return {
+      footprints: topology.nodes
+        .filter((node) => node.kind === "agent")
+        .map((node) => estimateAgentFootprint(topology, node.id, catalogs)),
+    };
+  },
+);
+
+app.get<{ Params: { topologyId: string } }>(
+  "/api/topologies/:topologyId/llama-swap-config",
+  async (request, reply) => {
+    const topology = store.getTopology(request.params.topologyId);
+    if (!topology) return reply.status(404).send({ error: "Topology not found" });
+    return generateLlamaSwapConfig(topology);
+  },
+);
+
+app.post<{ Body: unknown }>("/api/models/inspect", async (request) => {
+  const body = z
+    .object({ path: z.string().trim().min(1).max(2_000), contextWindow: z.number().int().min(512).optional() })
+    .parse(request.body);
+  return { inspection: await inspectGguf(body.path, body.contextWindow) };
+});
 
 app.post<{ Params: { topologyId: string; modelId: string } }>(
   "/api/topologies/:topologyId/models/:modelId/test",

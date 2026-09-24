@@ -13,6 +13,8 @@ import type {
   TopologyEdge,
   TopologyNode,
 } from "../shared/contracts.js";
+import { topologyNodeSchema } from "../shared/contracts.js";
+import type { z } from "zod";
 
 export type NodeMeta = {
   label: string;
@@ -96,9 +98,9 @@ export function edgeStyle(edge: TopologyEdge) {
   };
 }
 
-export function createNode(kind: NodeKind, index: number): TopologyNode {
-  const id = `${kind}-${crypto.randomUUID()}`;
-  const position = { x: 180 + (index % 3) * 290, y: 120 + Math.floor(index / 3) * 190 };
+type NodeInput = z.input<typeof topologyNodeSchema>;
+
+function draftNode(kind: NodeKind, id: string, position: { x: number; y: number }): NodeInput {
   switch (kind) {
     case "agent":
       return {
@@ -110,11 +112,7 @@ export function createNode(kind: NodeKind, index: number): TopologyNode {
         config: {
           role: "Specialist",
           instructions: "Complete assigned work precisely and return a verifiable result.",
-          entrypoint: false,
           autoDelegate: false,
-          conversationPersistence: "connected-storage",
-          temperature: 0.2,
-          maxOutputTokens: 1_024,
         },
       };
     case "model":
@@ -124,17 +122,7 @@ export function createNode(kind: NodeKind, index: number): TopologyNode {
         name: "Local model",
         description: "OpenAI-compatible local inference model.",
         position,
-        config: {
-          provider: "openai-compatible",
-          modelId: "local-model",
-          baseUrl: "http://127.0.0.1:8080/v1",
-          apiKeyEnv: "",
-          contextWindow: 8_192,
-          estimatedMemoryMb: 3_000,
-          idleTtlMs: 60_000,
-          requestTimeoutMs: 120_000,
-          lifecycle: "logical",
-        },
+        config: { provider: "openai-compatible", modelId: "local-model", estimatedMemoryMb: 3_000 },
       };
     case "capability":
       return {
@@ -161,12 +149,7 @@ export function createNode(kind: NodeKind, index: number): TopologyNode {
         name: "MCP connector",
         description: "A configured external capability boundary.",
         position,
-        config: {
-          connectorType: "mcp",
-          endpoint: "http://127.0.0.1:3333/mcp",
-          authEnv: "",
-          enabled: false,
-        },
+        config: { connectorType: "mcp", endpoint: "http://127.0.0.1:3333/mcp", enabled: false },
       };
     case "storage":
       return {
@@ -178,4 +161,11 @@ export function createNode(kind: NodeKind, index: number): TopologyNode {
         config: { storageType: "artifact-store", location: "artifacts" },
       };
   }
+}
+
+/** New nodes pass through the schema so every configuration default applies. */
+export function createNode(kind: NodeKind, index: number): TopologyNode {
+  const id = `${kind}-${crypto.randomUUID()}`;
+  const position = { x: 180 + (index % 3) * 290, y: 120 + Math.floor(index / 3) * 190 };
+  return topologyNodeSchema.parse(draftNode(kind, id, position));
 }

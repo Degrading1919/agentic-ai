@@ -4,6 +4,7 @@ import type {
   ConnectorNode,
   ModelNode,
   RelationshipKind,
+  RelationshipName,
   SkillNode,
   StorageNode,
   Topology,
@@ -11,6 +12,38 @@ import type {
   TopologyNode,
   ValidationIssue,
 } from "./contracts.js";
+
+const relationNames: Partial<Record<RelationshipKind, RelationshipName>> = {
+  agent_can_delegate_to_agent: "delegate",
+  agent_can_consult_agent: "consult",
+  agent_can_review_agent: "review",
+  agent_reports_to_agent: "report",
+  agent_can_handoff_to_agent: "handoff",
+};
+
+export function relationName(kind: RelationshipKind): RelationshipName {
+  return relationNames[kind] ?? "delegate";
+}
+
+export function relationshipKindFor(name: RelationshipName): RelationshipKind | null {
+  const entry = Object.entries(relationNames).find(([, value]) => value === name);
+  return (entry?.[0] as RelationshipKind | undefined) ?? null;
+}
+
+/** Plain-language runtime meaning of each collaboration relationship. */
+export const relationshipDescriptions: Record<RelationshipName, string> = {
+  root: "The entry work order created from a Work request.",
+  delegate:
+    "Transfers a bounded piece of work. The sender keeps overall responsibility and integrates the result.",
+  consult:
+    "Requests advice without transferring ownership. The consultant works read-only, and its failure never fails the requester.",
+  review:
+    "Evaluates completed work against the requirements and returns approve, revise, or reject. A revise verdict can trigger a bounded revision.",
+  report:
+    "Delivers the source agent's completion status to the target's inbox. No extra inference is triggered.",
+  handoff:
+    "Transfers responsibility for unfinished work. The receiver becomes the owner and inherits the return path.",
+};
 
 export const relationshipLabels: Record<RelationshipKind, string> = {
   agent_uses_model: "uses model",
@@ -153,6 +186,29 @@ export function validateTopology(topology: Topology): ValidationIssue[] {
     }
   }
 
+  for (const node of topology.nodes) {
+    if (node.kind === "connector" && node.config.enabled) {
+      const needsCommand =
+        node.config.connectorType === "mcp" && node.config.transport === "stdio";
+      if (needsCommand ? !node.config.command : !node.config.endpoint) {
+        issues.push({
+          severity: "warning",
+          code: "connector_unconfigured",
+          message: `Connector '${node.name}' is enabled but has no ${needsCommand ? "command" : "endpoint"}; it will expose no tools.`,
+          nodeId: node.id,
+        });
+      }
+    }
+    if (node.kind === "storage" && node.config.storageType === "vector-store") {
+      issues.push({
+        severity: "warning",
+        code: "storage_adapter_unavailable",
+        message: `Storage '${node.name}' uses the vector-store type, which has no adapter yet. Use the memory type for local retrieval.`,
+        nodeId: node.id,
+      });
+    }
+  }
+
   const agents = topology.nodes.filter((node): node is AgentNode => node.kind === "agent");
   if (!agents.some((agent) => agent.config.entrypoint)) {
     issues.push({
@@ -211,7 +267,7 @@ export function validateTopology(topology: Topology): ValidationIssue[] {
       severity: "warning",
       code: "delegation_cycle",
       message:
-        "Delegation relationships contain a cycle. This is legal topology, but the runtime will not recursively delegate child work in the MVP.",
+        "Delegation relationships contain a cycle. This is legal topology; at runtime an agent never receives work from its own delegation chain.",
     });
   }
 

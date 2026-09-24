@@ -5,6 +5,8 @@ import type {
   ModelNode,
   ToolCall,
 } from "../shared/contracts.js";
+import { estimateTokens } from "../shared/tokens.js";
+import { mockCompletion } from "./mock-provider.js";
 
 type OpenAIResponse = {
   choices?: Array<{
@@ -20,13 +22,12 @@ type OpenAIResponse = {
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
   };
+  /** llama.cpp server extension. */
+  timings?: { cache_n?: number; prompt_n?: number };
   error?: { message?: string };
 };
-
-function roughTokens(value: string): number {
-  return Math.max(1, Math.ceil(value.length / 4));
-}
 
 function normalizeContent(
   content: string | Array<{ type?: string; text?: string }> | null | undefined,
@@ -34,108 +35,6 @@ function normalizeContent(
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map((part) => part.text ?? "").join("");
   return "";
-}
-
-function lastUserText(request: CompletionRequest): string {
-  return [...request.messages].reverse().find((message) => message.role === "user")?.content ?? "";
-}
-
-function mockCompletion(request: CompletionRequest): CompletionResult {
-  const prompt = lastUserText(request);
-  const toolResult = [...request.messages]
-    .reverse()
-    .find((message) => message.role === "tool")?.content;
-
-  if (request.jsonSchema) {
-    const candidates = prompt
-      .split("\n")
-      .filter((line) => line.startsWith("CANDIDATE|"))
-      .map((line) => {
-        const [, agentId, name, relationship, role] = line.split("|");
-        return { agentId, name, relationship, role };
-      });
-    const content = JSON.stringify({
-      delegations: candidates.map((candidate) => ({
-        agentId: candidate.agentId,
-        objective: `Address the request as ${candidate.role || candidate.name}. Return the most decision-relevant result for the lead agent.`,
-        relationship: candidate.relationship,
-      })),
-      rationale:
-        candidates.length > 0
-          ? "Use each explicitly connected specialist and integrate their independent contributions."
-          : "Complete directly because no collaboration relationship is available.",
-    });
-    return {
-      content,
-      toolCalls: [],
-      usage: { promptTokens: roughTokens(prompt), completionTokens: roughTokens(content) },
-    };
-  }
-
-  const calculatorAvailable = request.tools?.some(
-    (tool) => tool.function.name === "calculator_evaluate",
-  );
-  const expressionMatch = prompt.match(
-    /(?:calculate|compute|evaluate|what\s+is)\s+([0-9eE+\-*/%^().\s]{1,160})/i,
-  );
-
-  if (calculatorAvailable && expressionMatch && !toolResult) {
-    const toolCall: ToolCall = {
-      id: `call_${randomUUID()}`,
-      type: "function",
-      function: {
-        name: "calculator_evaluate",
-        arguments: JSON.stringify({ expression: expressionMatch[1].trim() }),
-      },
-    };
-    return {
-      content: "",
-      toolCalls: [toolCall],
-      usage: { promptTokens: roughTokens(prompt), completionTokens: 8 },
-    };
-  }
-
-  let content: string;
-  if (toolResult) {
-    content = `The connected calculator returned ${toolResult}. I used only the capability granted to this worker and included the computed result in the deliverable.`;
-  } else if (prompt.includes("SPECIALIST OUTPUTS")) {
-    const outputSection = prompt.split("SPECIALIST OUTPUTS")[1]?.trim() ?? "";
-    content = [
-      "## Integrated result",
-      "",
-      "The team completed the request through the configured collaboration boundaries. The implementation contribution and independent review have been reconciled into one deliverable.",
-      "",
-      outputSection || "No specialist output was available, so the lead completed the work directly.",
-      "",
-      "## Decision notes",
-      "",
-      "- Execution used only connected models and resources.",
-      "- Completed work orders and this final result are durable and can be resumed or inspected.",
-    ].join("\n");
-  } else {
-    const objective = prompt.match(/OBJECTIVE\n([\s\S]*?)(?:\n\n|$)/)?.[1]?.trim() ?? prompt.trim();
-    content = [
-      "## Specialist response",
-      "",
-      `I analyzed the scoped objective: ${objective || "No objective supplied."}`,
-      "",
-      "### Recommended outcome",
-      "",
-      "Use a small, verifiable implementation slice with explicit inputs, observable state, and a concrete acceptance check. Keep capability access narrow and return evidence with the result so the lead agent can integrate it safely.",
-      "",
-      "### Checks",
-      "",
-      "- Confirm required inputs are available through connected resources.",
-      "- Test the outcome at the boundary where it will be consumed.",
-      "- Record any unresolved assumption instead of silently widening scope.",
-    ].join("\n");
-  }
-
-  return {
-    content,
-    toolCalls: [],
-    usage: { promptTokens: roughTokens(prompt), completionTokens: roughTokens(content) },
-  };
 }
 
 function apiUrl(model: ModelNode, pathname: string): string {
@@ -239,8 +138,11 @@ async function openAICompatibleCompletion(
     content,
     toolCalls,
     usage: {
-      promptTokens: payload.usage?.prompt_tokens ?? roughTokens(JSON.stringify(request.messages)),
-      completionTokens: payload.usage?.completion_tokens ?? roughTokens(content),
+      promptTokens: payload.usage?.prompt_tokens ?? estimateTokens(JSON.stringify(request.messages)),
+      completionTokens: payload.usage?.completion_tokens ?? estimateTokens(content),
+      cachedPromptTokens:
+        payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.timings?.cache_n ?? null,
+      estimated: payload.usage?.prompt_tokens === undefined,
     },
   };
 }
