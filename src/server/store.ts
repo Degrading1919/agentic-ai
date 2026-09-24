@@ -1,13 +1,21 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppState, ConnectorCatalog, Run, Topology } from "../shared/contracts.js";
-import { appStateSchema } from "../shared/contracts.js";
+import { appStateSchema, connectorCatalogSchema, runSchema, topologySchema } from "../shared/contracts.js";
 import { createDemoTopology } from "../shared/demo-topology.js";
 
 function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+/**
+ * Single-document durable state.
+ *
+ * Every mutation is transactional: the next state is built from a copy,
+ * validated, persisted with an atomic rename, and only then published as the
+ * live state. A validation error or a failed write leaves the live state
+ * exactly equal to the durable state. Readers never observe unpersisted data.
+ */
 export class LocalStore {
   readonly dataDir: string;
   readonly statePath: string;
@@ -35,16 +43,16 @@ export class LocalStore {
           `Unable to load local state at ${this.statePath}: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-
       const topology = createDemoTopology();
-      this.state = {
+      const initial: AppState = {
         version: 1,
         activeTopologyId: topology.id,
         topologies: [topology],
         runs: [],
         connectorCatalogs: [],
       };
-      await this.persist();
+      await this.writeDocument(`${JSON.stringify(initial, null, 2)}\n`);
+      this.state = initial;
     }
   }
 
@@ -53,34 +61,36 @@ export class LocalStore {
     return this.state;
   }
 
-  private async persist(): Promise<void> {
-    const state = this.requireState();
+  /** Atomic replace of the state document. Overridable to inject failures in tests. */
+  protected async writeDocument(content: string): Promise<void> {
     const temporaryPath = `${this.statePath}.next`;
-    await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await writeFile(temporaryPath, content, "utf8");
     await rename(temporaryPath, this.statePath);
   }
 
-  private enqueueMutation<T>(mutation: (state: AppState) => T): Promise<T> {
-    let resultPromise: Promise<T>;
-    resultPromise = this.writeChain.then(async () => {
-      const state = this.requireState();
-      const result = mutation(state);
-      appStateSchema.parse(state);
-      await this.persist();
+  /**
+   * Serialize a transaction: `build` returns the complete next state without
+   * touching the current one; it is persisted, then published.
+   */
+  private commit<T>(build: (current: AppState) => { next: AppState; result: T }): Promise<T> {
+    const task = this.writeChain.then(async () => {
+      const { next, result } = build(this.requireState());
+      await this.writeDocument(`${JSON.stringify(next, null, 2)}\n`);
+      this.state = next;
       return clone(result);
     });
-    this.writeChain = resultPromise.then(
+    this.writeChain = task.then(
       () => undefined,
       () => undefined,
     );
-    return resultPromise;
+    return task;
   }
 
   snapshot(): AppState {
     return clone(this.requireState());
   }
 
-  /** Resolves once every queued mutation has been persisted. */
+  /** Resolves once every queued mutation has been persisted (or rejected). */
   async flush(): Promise<void> {
     await this.writeChain;
   }
@@ -90,15 +100,19 @@ export class LocalStore {
   }
 
   async saveCatalog(catalog: ConnectorCatalog): Promise<ConnectorCatalog> {
-    return this.enqueueMutation((state) => {
-      state.connectorCatalogs = [
-        ...state.connectorCatalogs.filter(
-          (item) => !(item.connectorId === catalog.connectorId && item.fingerprint === catalog.fingerprint),
-        ),
-        clone(catalog),
-      ];
-      return catalog;
-    });
+    const valid = connectorCatalogSchema.parse(clone(catalog));
+    return this.commit((state) => ({
+      next: {
+        ...state,
+        connectorCatalogs: [
+          ...state.connectorCatalogs.filter(
+            (item) => !(item.connectorId === valid.connectorId && item.fingerprint === valid.fingerprint),
+          ),
+          valid,
+        ],
+      },
+      result: valid,
+    }));
   }
 
   listTopologies(): Topology[] {
@@ -111,13 +125,19 @@ export class LocalStore {
   }
 
   async saveTopology(topology: Topology): Promise<Topology> {
-    return this.enqueueMutation((state) => {
-      const next = clone(topology);
-      const existingIndex = state.topologies.findIndex((item) => item.id === next.id);
-      if (existingIndex >= 0) state.topologies[existingIndex] = next;
-      else state.topologies.push(next);
-      state.activeTopologyId = next.id;
-      return next;
+    const valid = topologySchema.parse(clone(topology));
+    return this.commit((state) => {
+      const exists = state.topologies.some((item) => item.id === valid.id);
+      return {
+        next: {
+          ...state,
+          activeTopologyId: valid.id,
+          topologies: exists
+            ? state.topologies.map((item) => (item.id === valid.id ? valid : item))
+            : [...state.topologies, valid],
+        },
+        result: valid,
+      };
     });
   }
 
@@ -171,31 +191,42 @@ export class LocalStore {
   }
 
   async createRun(run: Run): Promise<Run> {
-    return this.enqueueMutation((state) => {
-      if (state.runs.some((item) => item.id === run.id)) {
-        throw new Error(`Run '${run.id}' already exists.`);
+    const valid = runSchema.parse(clone(run));
+    return this.commit((state) => {
+      if (state.runs.some((item) => item.id === valid.id)) {
+        throw new Error(`Run '${valid.id}' already exists.`);
       }
-      state.runs.push(clone(run));
-      return run;
+      return { next: { ...state, runs: [...state.runs, valid] }, result: valid };
     });
   }
 
   async replaceRun(run: Run): Promise<Run> {
-    return this.enqueueMutation((state) => {
-      const index = state.runs.findIndex((item) => item.id === run.id);
-      if (index < 0) throw new Error(`Run '${run.id}' does not exist.`);
-      state.runs[index] = clone(run);
-      return run;
+    const valid = runSchema.parse(clone(run));
+    return this.commit((state) => {
+      if (!state.runs.some((item) => item.id === valid.id)) throw new Error(`Run '${valid.id}' does not exist.`);
+      return {
+        next: { ...state, runs: state.runs.map((item) => (item.id === valid.id ? valid : item)) },
+        result: valid,
+      };
     });
   }
 
+  /**
+   * Mutate a copy of one run. The callback may throw to abort the
+   * transaction; nothing it changed becomes visible.
+   */
   async mutateRun(id: string, mutation: (run: Run) => void): Promise<Run> {
-    return this.enqueueMutation((state) => {
-      const run = state.runs.find((item) => item.id === id);
-      if (!run) throw new Error(`Run '${id}' does not exist.`);
-      mutation(run);
-      run.updatedAt = new Date().toISOString();
-      return run;
+    return this.commit((state) => {
+      const current = state.runs.find((item) => item.id === id);
+      if (!current) throw new Error(`Run '${id}' does not exist.`);
+      const draft = clone(current);
+      mutation(draft);
+      draft.updatedAt = new Date().toISOString();
+      const valid = runSchema.parse(draft);
+      return {
+        next: { ...state, runs: state.runs.map((item) => (item.id === id ? valid : item)) },
+        result: valid,
+      };
     });
   }
 }
