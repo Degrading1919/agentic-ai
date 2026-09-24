@@ -101,7 +101,12 @@ export const modelNodeSchema = z.object({
     idleTtlMs: z.number().int().min(0).max(86_400_000).default(60_000),
     requestTimeoutMs: z.number().int().min(1_000).max(3_600_000).default(120_000),
     lifecycle: z.enum(["logical", "llama-swap"]).default("logical"),
-    estimatedVramMb: z.number().int().min(0).max(1_000_000).default(0),
+    /**
+     * VRAM this model occupies. `null` means unknown: when a VRAM budget is
+     * known the scheduler then treats the model as needing the whole GPU.
+     * `0` means explicitly CPU-only.
+     */
+    estimatedVramMb: z.number().int().min(0).max(1_000_000).nullable().default(null),
     parallelSlots: z.number().int().min(1).max(64).default(1),
     artifact: modelArtifactSchema.default(() => modelArtifactSchema.parse({})),
   }),
@@ -129,6 +134,16 @@ export const skillNodeSchema = z.object({
   }),
 });
 
+export const toolTrustPolicySchema = z.object({
+  name: z.string().min(1).max(200),
+  access: z.enum(["read", "write"]),
+  idempotent: z.boolean().default(false),
+  /** Hash of the tool definition this decision was made for. */
+  schemaHash: z.string().min(1).max(64),
+});
+
+export type ToolTrustPolicy = z.infer<typeof toolTrustPolicySchema>;
+
 export const connectorNodeSchema = z.object({
   ...baseNodeShape,
   kind: z.literal("connector"),
@@ -142,6 +157,16 @@ export const connectorNodeSchema = z.object({
     enabled: z.boolean().default(false),
     /** Empty means every discovered tool is authorized. */
     toolAllowlist: z.array(z.string().max(200)).max(1_000).default([]),
+    /**
+     * Local trust decisions per tool, pinned to the schema/annotation hash
+     * that was reviewed. Server annotations are advisory; only these entries
+     * make a tool read-only (usable by consult/review) or safe to retry.
+     */
+    trustPolicies: z.array(toolTrustPolicySchema).max(1_000).default([]),
+    /** How long a discovered catalog may be used before it is re-verified. */
+    catalogTtlMs: z.number().int().min(10_000).max(86_400_000).default(600_000),
+    /** HTTP API: the server honours the Idempotency-Key header for POST/PATCH. */
+    honorsIdempotencyKey: z.boolean().default(false),
     allowedMethods: z
       .array(z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]))
       .max(5)
@@ -222,6 +247,8 @@ export const workOrderStatusSchema = z.enum([
   "blocked",
   "handed_off",
   "superseded",
+  /** An external effect's outcome is unknown; a human must reconcile it. */
+  "awaiting_reconciliation",
 ]);
 
 export type WorkOrderStatus = z.infer<typeof workOrderStatusSchema>;
@@ -259,12 +286,38 @@ export const reviewFindingSchema = z.object({
 });
 
 export const reviewVerdictSchema = z.object({
-  verdict: z.enum(["approve", "revise", "reject"]),
+  verdict: z.enum(["approve", "revise", "reject", "indeterminate"]),
   summary: z.string().max(8_000).default(""),
   findings: z.array(reviewFindingSchema).max(50).default([]),
 });
 
 export type ReviewVerdict = z.infer<typeof reviewVerdictSchema>;
+
+export const toolCallSchema = z.object({
+  id: z.string(),
+  type: z.literal("function"),
+  function: z.object({ name: z.string(), arguments: z.string() }),
+});
+
+export const chatMessageSchema = z.object({
+  role: z.enum(["system", "user", "assistant", "tool"]),
+  content: z.string().nullable(),
+  name: z.string().optional(),
+  toolCallId: z.string().optional(),
+  toolCalls: z.array(toolCallSchema).optional(),
+  /** Harness operation ID for tool results; never sent to a provider. */
+  operationId: z.string().optional(),
+});
+
+export const executionCheckpointSchema = z.object({
+  purpose: z.enum(["execute", "integrate"]),
+  /** Assistant tool-call turns and tool results accumulated so far. */
+  messages: z.array(chatMessageSchema),
+  /** Deferred tool schemas already returned by find_tools. */
+  loaded: z.array(z.string()),
+});
+
+export type ExecutionCheckpoint = z.infer<typeof executionCheckpointSchema>;
 
 export const workOrderSchema = z.object({
   id: z.string().min(1),
@@ -305,6 +358,18 @@ export const workOrderSchema = z.object({
   verdict: reviewVerdictSchema.nullable().default(null),
   /** Direct work awaiting review before the owner finalizes it. */
   draft: z.string().nullable().default(null),
+  /**
+   * What independent review concluded about this order's output. Anything
+   * other than `approved` means the result is not a reviewed approval.
+   */
+  reviewOutcome: z
+    .enum(["approved", "revise_unresolved", "rejected", "indeterminate"])
+    .nullable()
+    .default(null),
+  /** Durable tool-loop checkpoint; resuming continues from it, never replays it. */
+  checkpoint: executionCheckpointSchema.nullable().default(null),
+  /** Operation ID of the tool call that owns this order (inline consults). */
+  ownerOperationId: z.string().nullable().default(null),
 });
 
 export type WorkOrder = z.infer<typeof workOrderSchema>;
@@ -352,6 +417,12 @@ export const runtimeEventSchema = z.object({
     "capability_loaded",
     "context_trimmed",
     "artifact_written",
+    "run_quiesced",
+    "tool_call_indeterminate",
+    "reconciliation_required",
+    "tool_call_reconciled",
+    "review_indeterminate",
+    "catalog_changed",
   ]),
   message: z.string(),
   createdAt: z.string(),
@@ -375,6 +446,7 @@ export const contextSegmentKindSchema = z.enum([
   "dependencies",
   "inbox",
   "tool_results",
+  "response_schema",
 ]);
 
 export type ContextSegmentKind = z.infer<typeof contextSegmentKindSchema>;
@@ -403,7 +475,17 @@ export const contextFrameSchema = z.object({
   reservedOutputTokens: z.number().int().nonnegative(),
   prefixHash: z.string(),
   toolsHash: z.string(),
-  prefixReused: z.boolean(),
+  /** Deprecated: replaced by localPrefixMatch. */
+  prefixReused: z.boolean().optional(),
+  /**
+   * The serialized request prefix (provider, model, system message, tools,
+   * response schema) equals the previous request dispatched to the same
+   * model. A local equality signal, not a backend cache measurement.
+   */
+  localPrefixMatch: z.boolean().default(false),
+  requestPrefixHash: z.string().default(""),
+  /** Earlier tool results that were elided or truncated to fit this call. */
+  elidedToolResults: z.number().int().nonnegative().default(0),
   exposure: z.enum(["eager", "deferred", "none"]),
   authorizedTools: z.number().int().nonnegative(),
   exposedToolSchemas: z.number().int().nonnegative(),
@@ -464,6 +546,49 @@ export const artifactRecordSchema = z.object({
 
 export type ArtifactRecord = z.infer<typeof artifactRecordSchema>;
 
+export const effectClassSchema = z.enum(["none", "idempotent", "effectful"]);
+export type EffectClass = z.infer<typeof effectClassSchema>;
+
+/**
+ * Durable record of one tool invocation. The status is written before and
+ * after the effect, so a restart can tell a call that never started from one
+ * whose outcome is unknown.
+ */
+export const toolCallRecordSchema = z.object({
+  id: z.string(),
+  workOrderId: z.string(),
+  agentId: z.string(),
+  toolName: z.string(),
+  targetName: z.string(),
+  sourceKind: z.enum(["builtin", "storage", "mcp", "http", "meta"]),
+  effect: effectClassSchema,
+  status: z.enum([
+    "planned",
+    "started",
+    "succeeded",
+    "failed",
+    "indeterminate",
+    "reconciled_applied",
+    "reconciled_not_applied",
+  ]),
+  /** Position of the requesting assistant turn in the checkpoint. */
+  turnIndex: z.number().int().nonnegative(),
+  callIndex: z.number().int().nonnegative(),
+  providerCallId: z.string(),
+  argumentsPreview: z.string().max(4_000),
+  idempotencyKey: z.string().nullable().default(null),
+  attempts: z.number().int().nonnegative().default(0),
+  result: z.string().max(20_000).nullable().default(null),
+  error: z.string().max(4_000).nullable().default(null),
+  childOrderId: z.string().nullable().default(null),
+  note: z.string().max(4_000).nullable().default(null),
+  createdAt: z.string(),
+  startedAt: z.string().nullable().default(null),
+  completedAt: z.string().nullable().default(null),
+});
+
+export type ToolCallRecord = z.infer<typeof toolCallRecordSchema>;
+
 export const runSchema = z.object({
   id: z.string().min(1),
   topologyId: z.string().min(1),
@@ -484,7 +609,12 @@ export const runSchema = z.object({
     elapsedMs: z.number().int().nonnegative(),
     cachedPromptTokens: z.number().int().nonnegative().default(0),
     estimatedPromptTokens: z.number().int().nonnegative().default(0),
-    prefixReuses: z.number().int().nonnegative().default(0),
+    /** Deprecated: replaced by localPrefixMatches. */
+    prefixReuses: z.number().int().nonnegative().optional(),
+    localPrefixMatches: z.number().int().nonnegative().default(0),
+    /** Calls whose server reported prompt usage / cached-token counts. */
+    usageReportedCalls: z.number().int().nonnegative().default(0),
+    cacheReportedCalls: z.number().int().nonnegative().default(0),
   }),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -497,6 +627,10 @@ export const runSchema = z.object({
   plans: z.array(delegationPlanRecordSchema).default([]),
   reports: z.array(reportRecordSchema).default([]),
   artifacts: z.array(artifactRecordSchema).default([]),
+  toolCalls: z.array(toolCallRecordSchema).default([]),
+  /** Set when a paused run has no in-flight model calls or tool effects. */
+  quiescedAt: z.string().nullable().default(null),
+  pauseReason: z.string().nullable().default(null),
 });
 
 export type Run = z.infer<typeof runSchema>;
@@ -508,6 +642,8 @@ export const catalogToolSchema = z.object({
   inputSchema: z.record(z.string(), z.unknown()).default({ type: "object", properties: {} }),
   readOnly: z.boolean().default(false),
   destructive: z.boolean().default(false),
+  /** Hash of name, description, schema, and annotations. */
+  schemaHash: z.string().default(""),
 });
 
 export type CatalogTool = z.infer<typeof catalogToolSchema>;
@@ -521,6 +657,10 @@ export const connectorCatalogSchema = z.object({
   serverVersion: z.string().default(""),
   tools: z.array(catalogToolSchema),
   error: z.string().nullable().default(null),
+  /** Hash over every tool definition; changes when the server's tools drift. */
+  revision: z.string().default(""),
+  /** Tools the server offered that exceeded local size/shape limits. */
+  rejectedTools: z.array(z.object({ name: z.string().max(200), reason: z.string().max(500) })).default([]),
 });
 
 export type ConnectorCatalog = z.infer<typeof connectorCatalogSchema>;
@@ -559,7 +699,15 @@ export type ModelRuntimeState = {
   provider: ModelNode["config"]["provider"];
   activeRunId: string | null;
   estimatedMemoryMb: number;
+  /** VRAM accounted for this model (the budget when the estimate is unknown). */
   estimatedVramMb: number;
+  vramEstimateKnown: boolean;
+  /** Configuration identity the accounting describes. */
+  configKey: string;
+  /** The saved configuration changed; re-accounting waits for in-flight requests. */
+  reconfigurePending: boolean;
+  /** Whether the harness controls physical residency (llama-swap) or only logical demand. */
+  residencyControl: "logical" | "llama-swap" | "simulated";
   parallelSlots: number;
   activeRequests: number;
   waitingRequests: number;
@@ -608,7 +756,11 @@ export type RuntimeSnapshot = {
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 
+export type ChatMessageRecord = z.infer<typeof chatMessageSchema>;
+
 export type ChatMessage = {
+  /** Harness operation ID for tool results; never sent to a provider. */
+  operationId?: string;
   role: ChatRole;
   content: string | null;
   name?: string;

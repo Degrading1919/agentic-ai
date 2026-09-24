@@ -1,9 +1,32 @@
 import type { ModelNode, ModelRuntimeState } from "../shared/contracts.js";
+import { stableHash } from "../shared/capabilities.js";
 import { requestLlamaSwapUnload } from "./providers.js";
 
 type TransitionHandler = (state: ModelRuntimeState) => void | Promise<void>;
 
 type Waiter = () => void;
+
+type Entry = {
+  state: ModelRuntimeState;
+  /** Configuration the accounting (and any physical residency) describes. */
+  loaded: ModelNode;
+  /** Latest configuration requested for this key. */
+  desired: ModelNode;
+};
+
+/** Residency is tracked per topology and model node. */
+export function modelPoolKey(topologyId: string, modelId: string): string {
+  return `${topologyId}/${modelId}`;
+}
+
+/** Identity of everything that changes what a resident model is or costs. */
+export function modelConfigKey(model: ModelNode): string {
+  const { provider, modelId, baseUrl, lifecycle, contextWindow, parallelSlots, estimatedMemoryMb, estimatedVramMb, artifact } =
+    model.config;
+  return stableHash(
+    JSON.stringify([provider, modelId, baseUrl, lifecycle, contextWindow, parallelSlots, estimatedMemoryMb, estimatedVramMb, artifact.path, artifact.gpuLayers, artifact.adapters]),
+  );
+}
 
 function cloneState(state: ModelRuntimeState): ModelRuntimeState {
   return structuredClone(state);
@@ -11,20 +34,31 @@ function cloneState(state: ModelRuntimeState): ModelRuntimeState {
 
 const occupiesMemory = (state: ModelRuntimeState) => !["unloaded", "failed"].includes(state.state);
 
+function residencyControl(model: ModelNode): ModelRuntimeState["residencyControl"] {
+  if (model.config.provider === "mock") return "simulated";
+  return model.config.lifecycle === "llama-swap" ? "llama-swap" : "logical";
+}
+
 /**
  * Deterministic model residency scheduler.
  *
- * - Each model has `parallelSlots` concurrent request slots (llama.cpp
- *   `--parallel`); extra requests queue FIFO on that model.
- * - Loading a model must fit the RAM budget and, when known, the VRAM budget.
- *   Idle models are evicted least-recently-used first. If nothing can be
- *   evicted the request waits for capacity instead of failing, which turns a
- *   small machine into a sequential executor rather than an error.
- * - A model larger than the budget on its own fails fast with guidance.
+ * - Residency is keyed by topology + model node and versioned by a
+ *   configuration key. A saved change re-accounts an idle model at once and
+ *   a busy one as soon as its in-flight requests (made with the old
+ *   configuration) drain; new requests never run under stale accounting.
+ * - Each model has `parallelSlots` concurrent request slots; extra requests
+ *   queue FIFO on that model.
+ * - Loading a model must fit the RAM budget and, when known, the VRAM
+ *   budget. An unknown VRAM estimate on a GPU-capable model is accounted as
+ *   the whole VRAM budget (exclusive GPU) rather than as zero.
+ * - Idle models are evicted least-recently-used first. If nothing can be
+ *   evicted the request waits for capacity instead of failing.
+ * - `residencyControl` says what the harness actually controls: physical
+ *   load/unload for llama-swap, logical demand only for externally managed
+ *   servers, simulation for the demo model.
  */
 export class ModelPool {
-  private readonly states = new Map<string, ModelRuntimeState>();
-  private readonly models = new Map<string, ModelNode>();
+  private readonly entries = new Map<string, Entry>();
   private readonly idleTimers = new Map<string, NodeJS.Timeout>();
   private readonly slotWaiters = new Map<string, Waiter[]>();
   private capacityWaiters: Waiter[] = [];
@@ -37,50 +71,80 @@ export class ModelPool {
   ) {}
 
   snapshot(): ModelRuntimeState[] {
-    return [...this.states.values()].map(cloneState);
+    return [...this.entries.values()].map((entry) => cloneState(entry.state));
   }
 
-  isLoaded(modelId: string): boolean {
-    const state = this.states.get(modelId);
+  isLoaded(key: string): boolean {
+    const state = this.entries.get(key)?.state;
     return Boolean(state && ["resident", "executing", "idle", "loading"].includes(state.state));
+  }
+
+  /** VRAM to account for a model; unknown estimates reserve the whole budget. */
+  vramFor(model: ModelNode): { mb: number; known: boolean } {
+    const estimate = model.config.estimatedVramMb;
+    if (estimate !== null) return { mb: estimate, known: true };
+    if (model.config.provider === "mock" || this.vramBudgetMb === null) return { mb: 0, known: false };
+    return { mb: this.vramBudgetMb, known: false };
   }
 
   async shutdown(): Promise<void> {
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
-    for (const modelId of [...this.states.keys()]) await this.unload(modelId);
+    for (const key of [...this.entries.keys()]) await this.unload(key);
   }
 
-  private stateFor(model: ModelNode): ModelRuntimeState {
-    this.models.set(model.id, structuredClone(model));
-    let state = this.states.get(model.id);
-    if (!state) {
-      state = {
-        modelId: model.id,
-        modelName: model.name,
-        state: "unloaded",
-        provider: model.config.provider,
-        activeRunId: null,
-        estimatedMemoryMb: model.config.estimatedMemoryMb,
-        estimatedVramMb: model.config.estimatedVramMb,
-        parallelSlots: model.config.parallelSlots,
-        activeRequests: 0,
-        waitingRequests: 0,
-        loadedAt: null,
-        lastUsedAt: null,
-        requestCount: 0,
-        lastError: null,
+  private account(entry: Entry, model: ModelNode): void {
+    const vram = this.vramFor(model);
+    Object.assign(entry.state, {
+      modelName: model.name,
+      provider: model.config.provider,
+      estimatedMemoryMb: model.config.estimatedMemoryMb,
+      estimatedVramMb: vram.mb,
+      vramEstimateKnown: vram.known,
+      parallelSlots: model.config.parallelSlots,
+      configKey: modelConfigKey(model),
+      residencyControl: residencyControl(model),
+      reconfigurePending: false,
+    });
+    entry.loaded = structuredClone(model);
+  }
+
+  private entryFor(key: string, model: ModelNode): Entry {
+    let entry = this.entries.get(key);
+    if (!entry) {
+      const vram = this.vramFor(model);
+      entry = {
+        loaded: structuredClone(model),
+        desired: structuredClone(model),
+        state: {
+          modelId: key,
+          modelName: model.name,
+          state: "unloaded",
+          provider: model.config.provider,
+          activeRunId: null,
+          estimatedMemoryMb: model.config.estimatedMemoryMb,
+          estimatedVramMb: vram.mb,
+          vramEstimateKnown: vram.known,
+          configKey: modelConfigKey(model),
+          reconfigurePending: false,
+          residencyControl: residencyControl(model),
+          parallelSlots: model.config.parallelSlots,
+          activeRequests: 0,
+          waitingRequests: 0,
+          loadedAt: null,
+          lastUsedAt: null,
+          requestCount: 0,
+          lastError: null,
+        },
       };
-      this.states.set(model.id, state);
+      this.entries.set(key, entry);
     }
-    state.modelName = model.name;
-    state.provider = model.config.provider;
-    if (!occupiesMemory(state)) {
-      state.estimatedMemoryMb = model.config.estimatedMemoryMb;
-      state.estimatedVramMb = model.config.estimatedVramMb;
+    entry.desired = structuredClone(model);
+    if (modelConfigKey(model) !== entry.state.configKey) {
+      if (!occupiesMemory(entry.state) && entry.state.activeRequests === 0) this.account(entry, model);
+      else entry.state.reconfigurePending = true;
     }
-    state.parallelSlots = model.config.parallelSlots;
-    return state;
+    return entry;
   }
 
   private async transition(
@@ -95,7 +159,7 @@ export class ModelPool {
   private usage(): { ramMb: number; vramMb: number } {
     let ramMb = 0;
     let vramMb = 0;
-    for (const state of this.states.values()) {
+    for (const { state } of this.entries.values()) {
       if (!occupiesMemory(state)) continue;
       ramMb += state.estimatedMemoryMb;
       vramMb += state.estimatedVramMb;
@@ -104,7 +168,8 @@ export class ModelPool {
   }
 
   private evictable(): ModelRuntimeState[] {
-    return [...this.states.values()]
+    return [...this.entries.values()]
+      .map((entry) => entry.state)
       .filter(
         (state) =>
           ["idle", "resident"].includes(state.state) &&
@@ -119,9 +184,7 @@ export class ModelPool {
 
   private fits(model: ModelNode, usage: { ramMb: number; vramMb: number }): boolean {
     const ramFits = usage.ramMb + model.config.estimatedMemoryMb <= this.memoryBudgetMb;
-    const vramFits =
-      this.vramBudgetMb === null ||
-      usage.vramMb + model.config.estimatedVramMb <= this.vramBudgetMb;
+    const vramFits = this.vramBudgetMb === null || usage.vramMb + this.vramFor(model).mb <= this.vramBudgetMb;
     return ramFits && vramFits;
   }
 
@@ -131,26 +194,34 @@ export class ModelPool {
         `Model '${model.name}' estimates ${model.config.estimatedMemoryMb} MB, above the configured ${this.memoryBudgetMb} MB residency budget. Increase AGENTIC_HARNESS_MEMORY_BUDGET_MB or use a smaller quantization.`,
       );
     }
-    if (this.vramBudgetMb !== null && model.config.estimatedVramMb > this.vramBudgetMb) {
+    const vram = this.vramFor(model);
+    if (this.vramBudgetMb !== null && vram.known && vram.mb > this.vramBudgetMb) {
       throw new Error(
-        `Model '${model.name}' estimates ${model.config.estimatedVramMb} MB of VRAM, above the ${this.vramBudgetMb} MB VRAM budget. Offload fewer layers or use a smaller quantization.`,
+        `Model '${model.name}' estimates ${vram.mb} MB of VRAM, above the ${this.vramBudgetMb} MB VRAM budget. Offload fewer layers or use a smaller quantization.`,
       );
     }
   }
 
   /**
    * Whether a request for this model could start now without waiting for a
-   * slot or for another model to finish. Used for affinity scheduling.
+   * slot, a reconfiguration, or another model to finish.
    */
-  canStartNow(model: ModelNode): boolean {
-    const state = this.states.get(model.id);
-    if (state && ["resident", "executing", "idle", "loading"].includes(state.state)) {
+  canStartNow(model: ModelNode, key: string = model.id): boolean {
+    const entry = this.entries.get(key);
+    const state = entry?.state;
+    if (state && modelConfigKey(model) !== state.configKey && state.activeRequests > 0) return false;
+    if (state && ["resident", "executing", "idle", "loading"].includes(state.state) && modelConfigKey(model) === state.configKey) {
       return state.activeRequests < model.config.parallelSlots;
     }
     if (state?.state === "unloading") return false;
     const usage = this.usage();
+    if (state && occupiesMemory(state)) {
+      usage.ramMb -= state.estimatedMemoryMb;
+      usage.vramMb -= state.estimatedVramMb;
+    }
     for (const candidate of this.evictable()) {
       if (this.fits(model, usage)) break;
+      if (candidate.modelId === key) continue;
       usage.ramMb -= candidate.estimatedMemoryMb;
       usage.vramMb -= candidate.estimatedVramMb;
     }
@@ -190,11 +261,23 @@ export class ModelPool {
     });
   }
 
-  private async ensureLoaded(model: ModelNode, state: ModelRuntimeState, signal?: AbortSignal) {
+  /** Bring accounting (and llama-swap physical state) in line with the desired config. */
+  private async reconfigure(key: string, entry: Entry, model: ModelNode): Promise<void> {
+    await this.withPoolLock(async () => {
+      if (modelConfigKey(model) === entry.state.configKey) return;
+      if (occupiesMemory(entry.state)) await this.unloadLocked(key);
+      this.account(entry, model);
+    });
+    this.wakeCapacityWaiters();
+  }
+
+  private async ensureLoaded(key: string, entry: Entry, model: ModelNode, signal?: AbortSignal) {
     this.assertFitsAlone(model);
+    const state = entry.state;
     while (true) {
       const outcome = await this.withPoolLock(async () => {
         if (!["unloaded", "failed"].includes(state.state)) return "ready" as const;
+        this.account(entry, model);
         const usage = this.usage();
         for (const candidate of this.evictable()) {
           if (this.fits(model, usage)) break;
@@ -204,11 +287,7 @@ export class ModelPool {
           usage.vramMb = refreshed.vramMb;
         }
         if (!this.fits(model, usage)) return "wait" as const;
-        await this.transition(state, "loading", {
-          lastError: null,
-          estimatedMemoryMb: model.config.estimatedMemoryMb,
-          estimatedVramMb: model.config.estimatedVramMb,
-        });
+        await this.transition(state, "loading", { lastError: null });
         // llama-swap performs the physical load when the first request reaches
         // it; this transition records the scheduler's deterministic intent.
         await new Promise((resolve) => setTimeout(resolve, model.config.provider === "mock" ? 25 : 0));
@@ -221,11 +300,18 @@ export class ModelPool {
     }
   }
 
-  private async acquireSlot(model: ModelNode, state: ModelRuntimeState, signal?: AbortSignal) {
-    while (state.activeRequests >= model.config.parallelSlots || state.state === "unloading") {
+  private async acquireSlot(key: string, entry: Entry, model: ModelNode, signal?: AbortSignal) {
+    const state = entry.state;
+    const configKey = modelConfigKey(model);
+    const blocked = () =>
+      state.activeRequests >= model.config.parallelSlots ||
+      state.state === "unloading" ||
+      // A changed configuration waits for requests made with the old one to drain.
+      (state.configKey !== configKey && state.activeRequests > 0);
+    while (blocked()) {
       await new Promise<void>((resolve, reject) => {
         if (signal?.aborted) return reject(new DOMException("Run paused", "AbortError"));
-        const waiters = this.slotWaiters.get(model.id) ?? [];
+        const waiters = this.slotWaiters.get(key) ?? [];
         const wake = () => {
           signal?.removeEventListener("abort", onAbort);
           resolve();
@@ -238,16 +324,18 @@ export class ModelPool {
         };
         signal?.addEventListener("abort", onAbort, { once: true });
         waiters.push(wake);
-        this.slotWaiters.set(model.id, waiters);
+        this.slotWaiters.set(key, waiters);
       });
     }
     state.activeRequests += 1;
   }
 
-  private releaseSlot(model: ModelNode, state: ModelRuntimeState): void {
+  private releaseSlot(key: string, state: ModelRuntimeState): void {
     state.activeRequests = Math.max(0, state.activeRequests - 1);
-    const next = this.slotWaiters.get(model.id)?.shift();
-    next?.();
+    // Wake everyone: a reconfiguration waiter may be able to proceed now.
+    const waiters = this.slotWaiters.get(key) ?? [];
+    this.slotWaiters.set(key, []);
+    for (const wake of waiters) wake();
   }
 
   async withModel<T>(
@@ -255,21 +343,24 @@ export class ModelPool {
     runId: string,
     operation: () => Promise<T>,
     signal?: AbortSignal,
+    key: string = model.id,
   ): Promise<T> {
-    const state = this.stateFor(model);
-    const timer = this.idleTimers.get(model.id);
+    const entry = this.entryFor(key, model);
+    const state = entry.state;
+    const timer = this.idleTimers.get(key);
     if (timer) clearTimeout(timer);
-    this.idleTimers.delete(model.id);
+    this.idleTimers.delete(key);
 
     state.waitingRequests += 1;
     try {
-      await this.acquireSlot(model, state, signal);
+      await this.acquireSlot(key, entry, model, signal);
     } finally {
       state.waitingRequests -= 1;
     }
 
     try {
-      await this.ensureLoaded(model, state, signal);
+      if (modelConfigKey(model) !== state.configKey) await this.reconfigure(key, entry, model);
+      await this.ensureLoaded(key, entry, model, signal);
       await this.transition(state, "executing", {
         activeRunId: runId,
         requestCount: state.requestCount + 1,
@@ -282,44 +373,71 @@ export class ModelPool {
       }
       throw error;
     } finally {
-      this.releaseSlot(model, state);
+      this.releaseSlot(key, state);
       if (state.activeRequests === 0 && occupiesMemory(state) && state.state !== "unloading") {
         await this.transition(state, "idle", {
           activeRunId: null,
           lastUsedAt: new Date().toISOString(),
         });
-        this.scheduleUnload(model);
+        if (state.reconfigurePending) await this.reconfigure(key, entry, entry.desired);
+        else this.scheduleUnload(key, entry.loaded);
       }
       this.wakeCapacityWaiters();
     }
   }
 
-  private scheduleUnload(model: ModelNode): void {
-    const existing = this.idleTimers.get(model.id);
-    if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => void this.unload(model.id), model.config.idleTtlMs);
-    timer.unref();
-    this.idleTimers.set(model.id, timer);
+  /**
+   * Apply a saved topology: re-account changed models (unloading the old
+   * physical model when idle) and retire models that were removed.
+   */
+  async reconcile(topologyId: string, models: Array<{ key: string; model: ModelNode }>): Promise<void> {
+    const wanted = new Map(models.map((item) => [item.key, item.model]));
+    for (const [key, entry] of [...this.entries.entries()]) {
+      if (!key.startsWith(`${topologyId}/`)) continue;
+      const model = wanted.get(key);
+      const busy = entry.state.activeRequests > 0 || entry.state.waitingRequests > 0;
+      if (!model) {
+        if (!busy) {
+          await this.unload(key);
+          this.entries.delete(key);
+        }
+        continue;
+      }
+      entry.desired = structuredClone(model);
+      if (modelConfigKey(model) === entry.state.configKey) continue;
+      if (busy) entry.state.reconfigurePending = true;
+      else await this.reconfigure(key, entry, model);
+    }
   }
 
-  async unload(modelId: string): Promise<void> {
-    await this.withPoolLock(() => this.unloadLocked(modelId));
+  private scheduleUnload(key: string, model: ModelNode): void {
+    const existing = this.idleTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => void this.unload(key), model.config.idleTtlMs);
+    timer.unref();
+    this.idleTimers.set(key, timer);
+  }
+
+  async unload(key: string): Promise<void> {
+    await this.withPoolLock(() => this.unloadLocked(key));
     this.wakeCapacityWaiters();
   }
 
-  private async unloadLocked(modelId: string): Promise<void> {
-    const state = this.states.get(modelId);
-    const model = this.models.get(modelId);
-    if (!state || !model || ["unloaded", "unloading", "failed"].includes(state.state)) return;
+  private async unloadLocked(key: string): Promise<void> {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    const { state } = entry;
+    if (["unloaded", "unloading", "failed"].includes(state.state)) return;
     if (state.activeRequests > 0 || state.waitingRequests > 0) return;
 
-    const timer = this.idleTimers.get(modelId);
+    const timer = this.idleTimers.get(key);
     if (timer) clearTimeout(timer);
-    this.idleTimers.delete(modelId);
+    this.idleTimers.delete(key);
 
     await this.transition(state, "unloading");
     try {
-      await requestLlamaSwapUnload(model);
+      // Unload what is actually resident: the configuration it was loaded with.
+      await requestLlamaSwapUnload(entry.loaded);
       await this.transition(state, "unloaded", { activeRunId: null, loadedAt: null });
     } catch (error) {
       await this.transition(state, "failed", {

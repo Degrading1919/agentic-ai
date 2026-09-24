@@ -81,7 +81,22 @@ describe("GGUF inspection", () => {
     });
     // 2 × 28 layers × 8192 ctx × 8 kv-heads × 128 dim × 2 bytes = 896 MiB
     expect(inspection.kvCacheMb).toBe(896);
-    expect(inspection.estimatedMemoryMb).toBe(inspection.fileSizeMb + 896 + 256);
+    // Server-default offload is treated as full offload: weights + KV on the GPU (audit A6).
+    expect(inspection.offloadedLayers).toBe(28);
+    expect(inspection.estimatedVramMb).toBe(inspection.fileSizeMb + 896 + 384);
+    expect(inspection.estimatedMemoryMb).toBe(256);
+    expect(inspection.assumptions).toMatch(/Estimates, not measurements/);
+
+    // Partial offload splits weights and KV cache; parallel slots multiply the KV cache.
+    const partial = await inspectGguf(file, 8_192, { gpuLayers: 14, parallelSlots: 2 });
+    expect(partial.kvContextTokens).toBe(16_384);
+    expect(partial.kvCacheMb).toBe(1_792);
+    expect(partial.estimatedVramMb).toBe(Math.round((partial.fileSizeMb + 1_792) / 2 + 384));
+    expect(partial.estimatedMemoryMb).toBe(Math.round((partial.fileSizeMb + 1_792) / 2 + 256));
+
+    const cpuOnly = await inspectGguf(file, 8_192, { gpuLayers: 0 });
+    expect(cpuOnly.estimatedVramMb).toBe(0);
+    expect(cpuOnly.estimatedMemoryMb).toBe(cpuOnly.fileSizeMb + 896 + 256);
   });
 
   it("rejects non-GGUF input", async () => {
@@ -130,7 +145,7 @@ describe("llama-swap configuration", () => {
     expect(included).toEqual(["Runtime coder"]);
     expect(skipped.map((entry) => entry.model)).toContain("Built-in demo model");
     expect(yaml).toContain("  runtime-coder:");
-    expect(yaml).toContain("llama-server --port ${PORT} -m /models/runtime-coder.Q4_K_M.gguf -c 16384 --parallel 2 --alias runtime-coder -ngl 99 --lora-scaled /models/style.lora.gguf 0.5");
+    expect(yaml).toContain("llama-server --port ${PORT} -m /models/runtime-coder.Q4_K_M.gguf -c 32768 --parallel 2 --alias runtime-coder -ngl 99 --lora-scaled /models/style.lora.gguf 0.5");
     expect(yaml).toContain("    ttl: 120");
   });
 });

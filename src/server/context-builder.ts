@@ -138,8 +138,10 @@ export function buildFrame(input: {
   packed: PackedContext;
   prefix: StablePrefix;
   tailTokens: number;
-  prefixReused: boolean;
   sendTools: boolean;
+  /** Tokens of the JSON response schema sent with schema-constrained calls. */
+  responseSchemaTokens?: number;
+  elidedToolResults?: number;
 }): ContextFrame {
   const segments = input.packed.segments
     .filter((item) => input.sendTools || item.kind !== "tool_schemas")
@@ -150,13 +152,22 @@ export function buildFrame(input: {
       stable: item.stable,
       trimmed: Boolean(item.trimmed),
     }));
+  if (input.responseSchemaTokens) {
+    segments.push({
+      kind: "response_schema",
+      label: "Response schema",
+      tokens: input.responseSchemaTokens,
+      stable: true,
+      trimmed: false,
+    });
+  }
   if (input.tailTokens > 0) {
     segments.push({
       kind: "tool_results",
       label: "Tool calls and results",
       tokens: input.tailTokens,
       stable: false,
-      trimmed: false,
+      trimmed: (input.elidedToolResults ?? 0) > 0,
     });
   }
   const estimatedPromptTokens =
@@ -174,7 +185,9 @@ export function buildFrame(input: {
     reservedOutputTokens: input.agent.config.maxOutputTokens,
     prefixHash: sha(input.prefix.system),
     toolsHash: sha(input.sendTools ? JSON.stringify(input.prefix.tools) : "[]"),
-    prefixReused: input.prefixReused,
+    localPrefixMatch: false,
+    requestPrefixHash: "",
+    elidedToolResults: input.elidedToolResults ?? 0,
     exposure: input.prefix.exposure.mode,
     authorizedTools: input.prefix.descriptors.length,
     exposedToolSchemas: input.sendTools ? input.prefix.exposure.native.length : 0,
@@ -182,6 +195,94 @@ export function buildFrame(input: {
     cachedPromptTokens: null,
     createdAt: new Date().toISOString(),
   };
+}
+
+/** Tokens kept free for the model's next tool-call arguments. */
+export const TOOL_CALL_HEADROOM = 256;
+
+function messageTokens(message: ChatMessage): number {
+  const calls = message.toolCalls ? JSON.stringify(message.toolCalls) : "";
+  return estimateTokens(message.content ?? "") + estimateTokens(calls) + MESSAGE_OVERHEAD_TOKENS;
+}
+
+/** Budget available to the tool loop after the packed system/user messages. */
+export function toolTailBudget(packed: PackedContext): number {
+  const dynamicTokens = packed.segments
+    .filter((item) => !item.stable)
+    .reduce((sum, item) => sum + item.tokens, 0);
+  return packed.availableTokens - dynamicTokens - TOOL_CALL_HEADROOM;
+}
+
+export type FittedTail = { messages: ChatMessage[]; tailTokens: number; elided: number };
+
+/**
+ * Fit the tool loop's accumulated turns into the remaining window before a
+ * model call. Deterministic, oldest first:
+ *   1. replace earlier tool results with a reference stub (read_artifact tool:<id>);
+ *   2. truncate the newest results;
+ *   3. drop the oldest whole turns (assistant call + its results).
+ * Throws ContextBudgetError if even the newest turn cannot fit.
+ */
+export function fitToolTail(packed: PackedContext, tail: ChatMessage[]): FittedTail {
+  const budget = toolTailBudget(packed);
+  const turns: ChatMessage[][] = [];
+  for (const message of tail) {
+    if (message.role === "assistant" || turns.length === 0 || message.role === "user") {
+      turns.push([{ ...message }]);
+    } else {
+      turns[turns.length - 1]?.push({ ...message });
+    }
+  }
+  const total = () => turns.flat().reduce((sum, message) => sum + messageTokens(message), 0);
+  let elided = 0;
+  const stub = (message: ChatMessage) =>
+    `[Earlier result of ${message.name ?? "tool"} elided to fit the context window (≈${estimateTokens(message.content ?? "")} tokens).${message.operationId ? ` Retrieve it with read_artifact("tool:${message.operationId}") if needed.` : ""}]`;
+
+  for (const turn of turns.slice(0, -1)) {
+    if (total() <= budget) break;
+    for (const message of turn) {
+      if (message.role !== "tool" || message.content?.startsWith("[Earlier result of")) continue;
+      message.content = stub(message);
+      elided += 1;
+    }
+  }
+  const last = turns.at(-1) ?? [];
+  const results = last.filter((message) => message.role === "tool");
+  if (total() > budget && results.length > 0) {
+    const fixed = total() - results.reduce((sum, message) => sum + messageTokens(message), 0);
+    const share = Math.max(48, Math.floor((budget - fixed) / results.length) - MESSAGE_OVERHEAD_TOKENS);
+    for (const message of results) {
+      const truncated = truncateToTokens(message.content ?? "", share);
+      if (truncated.trimmed) {
+        message.content = `${truncated.text}${message.operationId ? `\n[Full result: read_artifact("tool:${message.operationId}")]` : ""}`;
+        elided += 1;
+      }
+    }
+  }
+  let dropped = 0;
+  const droppedOperations: string[] = [];
+  const note = (): ChatMessage => ({
+    role: "user",
+    content: `[${dropped} earlier tool turn${dropped === 1 ? " was" : "s were"} removed to fit the context window.${droppedOperations.length ? ` Their results remain available: ${droppedOperations.map((id) => `read_artifact("tool:${id}")`).join(", ")}.` : ""}]`,
+  });
+  // Measure with the reference note included, so the final tail really fits.
+  const totalWithNote = () => total() + (dropped > 0 ? messageTokens(note()) : 0);
+  while (totalWithNote() > budget && turns.length > 1) {
+    const removed = turns.shift() ?? [];
+    for (const message of removed) if (message.operationId) droppedOperations.push(message.operationId);
+    dropped += 1;
+  }
+  if (dropped > 0) {
+    turns.unshift([note()]);
+    elided += dropped;
+  }
+  const tailTokens = total();
+  if (tailTokens > budget) {
+    throw new ContextBudgetError(
+      `Tool results need ≈${tailTokens} tokens but only ≈${Math.max(0, budget)} remain in the model window after the work order. Use a larger context window, a smaller connector result limit, or fewer tools per step.`,
+    );
+  }
+  return { messages: turns.flat(), tailTokens, elided };
 }
 
 /** Extractive digest for completed work; no extra inference. */

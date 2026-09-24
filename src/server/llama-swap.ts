@@ -15,7 +15,8 @@ export function llamaServerCommand(model: ModelNode): string {
     "llama-server",
     "--port ${PORT}",
     `-m ${quote(artifact.path)}`,
-    `-c ${model.config.contextWindow}`,
+    // -c is shared by all --parallel slots; give each slot the node's full window.
+    `-c ${model.config.contextWindow * model.config.parallelSlots}`,
     `--parallel ${model.config.parallelSlots}`,
     `--alias ${quote(model.config.modelId)}`,
   ];

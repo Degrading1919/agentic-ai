@@ -24,6 +24,8 @@ function withConnector(toolCount: number): { topology: Topology; catalogs: Conne
     serverName: "fixture",
     serverVersion: "1",
     error: null,
+    revision: "rev-1",
+    rejectedTools: [],
     tools: Array.from({ length: toolCount }, (_, index) => ({
       name: `tool_${String(index).padStart(3, "0")}`,
       title: "",
@@ -34,6 +36,7 @@ function withConnector(toolCount: number): { topology: Topology; catalogs: Conne
         required: ["id"],
       },
       readOnly: index % 2 === 0,
+      schemaHash: `hash-${index}`,
       destructive: index % 2 === 1,
     })),
   };
@@ -123,22 +126,31 @@ describe("deferred capability exposure", () => {
     expect(prefix.system).toContain("- mcp_mcp_server__tool_003: Fixture tool 3.");
   });
 
-  it("honours the connector allowlist and read-only annotations", () => {
+  it("honours the connector allowlist and grants read-only access only through local trust (audit A5)", () => {
     const { topology, catalogs } = withConnector(10);
     const connector = topology.nodes.find((candidate) => candidate.id === "connector-mcp") as ConnectorNode;
     connector.config.toolAllowlist = ["tool_000", "tool_001", "tool_002"];
-    const context = getAgentContext(topology, "agent-orchestrator")!;
-    const full = resolveToolDescriptors(context, catalogs, "full").filter((d) => d.source.kind === "mcp");
-    const readOnly = resolveToolDescriptors(context, catalogs, "read-only").filter((d) => d.source.kind === "mcp");
-    expect(full.map((descriptor) => descriptor.source.kind === "mcp" && descriptor.source.toolName)).toEqual([
-      "tool_000",
-      "tool_001",
-      "tool_002",
-    ]);
-    expect(readOnly.map((descriptor) => descriptor.source.kind === "mcp" && descriptor.source.toolName)).toEqual([
-      "tool_000",
-      "tool_002",
-    ]);
+    const names = (mode: "full" | "read-only") =>
+      resolveToolDescriptors(getAgentContext(topology, "agent-orchestrator")!, catalogs, mode)
+        .filter((descriptor) => descriptor.source.kind === "mcp")
+        .map((descriptor) => descriptor.source.kind === "mcp" && descriptor.source.toolName);
+    expect(names("full")).toEqual(["tool_000", "tool_001", "tool_002"]);
+    // tool_000 and tool_002 carry readOnlyHint from the server, which is not enough.
+    expect(names("read-only")).toEqual([]);
+
+    // A local decision pinned to the current definition makes a tool read-only.
+    connector.config.trustPolicies = [
+      { name: "tool_000", access: "read", idempotent: false, schemaHash: "hash-0" },
+      // Pinned to an older definition: the server changed it since review.
+      { name: "tool_002", access: "read", idempotent: false, schemaHash: "hash-stale" },
+      // Local policy can also make an unannotated tool read-only.
+      { name: "tool_001", access: "read", idempotent: false, schemaHash: "hash-1" },
+    ];
+    expect(names("read-only")).toEqual(["tool_000", "tool_001"]);
+    const effects = resolveToolDescriptors(getAgentContext(topology, "agent-orchestrator")!, catalogs, "full")
+      .filter((descriptor) => descriptor.source.kind === "mcp")
+      .map((descriptor) => descriptor.effect);
+    expect(effects).toEqual(["none", "none", "effectful"]);
   });
 
   it("ignores stale catalogs after the connector configuration changes", () => {

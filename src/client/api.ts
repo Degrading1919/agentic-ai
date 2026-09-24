@@ -83,6 +83,14 @@ export const api = {
     );
   },
 
+  async reconcileToolCall(runId: string, operationId: string, applied: boolean, note: string): Promise<Run> {
+    const result = await request<{ run: Run }>(
+      `/api/runs/${encodeURIComponent(runId)}/tool-calls/${encodeURIComponent(operationId)}/reconcile`,
+      { method: "POST", body: JSON.stringify({ applied, note }) },
+    );
+    return result.run;
+  },
+
   async createExampleTopology(): Promise<{ topology: Topology; issues: ValidationIssue[] }> {
     return request("/api/topologies/example", { method: "POST" });
   },
@@ -103,10 +111,13 @@ export const api = {
     throw new Error(payload.error ?? `Discovery failed with HTTP ${response.status}.`);
   },
 
-  async inspectModel(path: string, contextWindow?: number): Promise<ModelInspection> {
+  async inspectModel(
+    path: string,
+    options: { contextWindow?: number; gpuLayers?: number; parallelSlots?: number } = {},
+  ): Promise<ModelInspection> {
     const result = await request<{ inspection: ModelInspection }>("/api/models/inspect", {
       method: "POST",
-      body: JSON.stringify({ path, contextWindow }),
+      body: JSON.stringify({ path, ...options }),
     });
     return result.inspection;
   },
@@ -135,6 +146,10 @@ export type ModelInspection = {
   baseModel: string;
   isAdapter: boolean;
   estimatedMemoryMb: number;
+  estimatedVramMb: number;
   kvCacheMb: number;
   contextWindowForEstimate: number;
+  kvContextTokens: number;
+  offloadedLayers: number;
+  assumptions: string;
 };

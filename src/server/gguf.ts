@@ -243,11 +243,44 @@ export type ModelInspection = {
   headCountKv: number | null;
   baseModel: string;
   isAdapter: boolean;
-  /** Estimated resident memory for the requested context (weights + f16 KV cache + overhead). */
+  /** Estimated host RAM: weights and KV cache for layers kept on the CPU, plus overhead. */
   estimatedMemoryMb: number;
+  /** Estimated VRAM: offloaded weights and KV cache, plus a compute buffer. */
+  estimatedVramMb: number;
   kvCacheMb: number;
   contextWindowForEstimate: number;
+  /** Total KV context (window × parallel slots) the estimate assumes. */
+  kvContextTokens: number;
+  offloadedLayers: number;
+  assumptions: string;
 };
+
+/** Host-side and GPU-side fixed costs used by the estimate (conservative round numbers). */
+const HOST_OVERHEAD_MB = 256;
+const GPU_COMPUTE_BUFFER_MB = 384;
+
+/**
+ * Split a model's memory between host RAM and VRAM from its offload setting.
+ * `gpuLayers < 0` (server default) is treated as full offload, which is the
+ * conservative assumption for VRAM on a GPU host.
+ */
+export function splitMemory(input: {
+  fileSizeMb: number;
+  kvCacheMb: number;
+  blockCount: number | null;
+  gpuLayers: number;
+}): { ramMb: number; vramMb: number; offloadedLayers: number } {
+  const layers = input.blockCount ?? 0;
+  const offloadedLayers = input.gpuLayers < 0 ? layers : Math.min(input.gpuLayers, layers);
+  const fraction = layers > 0 ? offloadedLayers / layers : input.gpuLayers === 0 ? 0 : 1;
+  const onGpu = (input.fileSizeMb + input.kvCacheMb) * fraction;
+  const onHost = (input.fileSizeMb + input.kvCacheMb) * (1 - fraction);
+  return {
+    ramMb: Math.round(onHost + HOST_OVERHEAD_MB),
+    vramMb: Math.round(fraction > 0 ? onGpu + GPU_COMPUTE_BUFFER_MB : 0),
+    offloadedLayers,
+  };
+}
 
 /** KV cache bytes for an f16 cache: 2 (K,V) × layers × ctx × kv_heads × head_dim × 2 bytes. */
 export function estimateKvCacheMb(input: {
@@ -266,7 +299,13 @@ export function estimateKvCacheMb(input: {
   return Math.round(bytes / 1024 / 1024);
 }
 
-export async function inspectGguf(filePath: string, contextWindow = 8_192): Promise<ModelInspection> {
+export async function inspectGguf(
+  filePath: string,
+  contextWindow = 8_192,
+  options: { gpuLayers?: number; parallelSlots?: number } = {},
+): Promise<ModelInspection> {
+  const gpuLayers = options.gpuLayers ?? -1;
+  const parallelSlots = Math.max(1, options.parallelSlots ?? 1);
   const resolved = path.resolve(filePath);
   if (path.extname(resolved).toLowerCase() !== ".gguf") throw new Error("Only .gguf files can be inspected.");
   const info = await stat(resolved);
@@ -282,8 +321,12 @@ export async function inspectGguf(filePath: string, contextWindow = 8_192): Prom
   const keyLength = num(key("attention.key_length"));
   const trained = num(key("context_length")) ?? 0;
   const window = Math.max(512, Math.min(contextWindow, trained || contextWindow));
-  const kvCacheMb = estimateKvCacheMb({ blockCount, embeddingLength, headCount, headCountKv, keyLength, contextWindow: window });
+  // llama-server splits -c across --parallel slots; the generated config gives
+  // every slot the full window, so the KV cache covers window × slots.
+  const kvContextTokens = window * parallelSlots;
+  const kvCacheMb = estimateKvCacheMb({ blockCount, embeddingLength, headCount, headCountKv, keyLength, contextWindow: kvContextTokens });
   const fileSizeMb = Math.round(info.size / 1024 / 1024);
+  const split = splitMemory({ fileSizeMb, kvCacheMb, blockCount, gpuLayers });
   const baseModel = [str(metadata["general.base_model.0.name"]), str(metadata["general.base_model.0.organization"])]
     .filter(Boolean)
     .join(" · ");
@@ -302,8 +345,12 @@ export async function inspectGguf(filePath: string, contextWindow = 8_192): Prom
     headCountKv,
     baseModel,
     isAdapter: str(metadata["general.type"]) === "adapter",
-    estimatedMemoryMb: fileSizeMb + kvCacheMb + 256,
+    estimatedMemoryMb: split.ramMb,
+    estimatedVramMb: split.vramMb,
     kvCacheMb,
     contextWindowForEstimate: window,
+    kvContextTokens,
+    offloadedLayers: split.offloadedLayers,
+    assumptions: `f16 KV cache for ${kvContextTokens} tokens (${window} × ${parallelSlots} slot${parallelSlots === 1 ? "" : "s"}); ${split.offloadedLayers}/${blockCount ?? "?"} layers on GPU${gpuLayers < 0 ? " (server default treated as full offload)" : ""}; +${HOST_OVERHEAD_MB} MB host, +${GPU_COMPUTE_BUFFER_MB} MB GPU compute buffer. Estimates, not measurements.`,
   };
 }

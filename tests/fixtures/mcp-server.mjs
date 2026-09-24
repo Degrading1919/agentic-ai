@@ -38,6 +38,22 @@ export function createFixtureServer(generatedToolCount = 0) {
     { description: "Always returns a tool error.", inputSchema: {} },
     async () => ({ content: [{ type: "text", text: "fixture failure" }], isError: true }),
   );
+  for (const suffix of ["a", "b", "c"]) {
+    server.registerTool(
+      `big_payload_${suffix}`,
+      {
+        description: `Return a large report (${suffix}) used to test context fitting.`,
+        inputSchema: {},
+        annotations: { readOnlyHint: true },
+      },
+      async () => ({ content: [{ type: "text", text: `REPORT-${suffix.toUpperCase()} ` + "detailed measurement row ".repeat(900) }] }),
+    );
+  }
+  server.registerTool(
+    "huge_message",
+    { description: "Return a single message larger than the client's message limit.", inputSchema: {} },
+    async () => ({ content: [{ type: "text", text: "x".repeat(5 * 1024 * 1024) }] }),
+  );
   for (let index = 0; index < generatedToolCount; index += 1) {
     server.registerTool(
       `generated_tool_${index}`,

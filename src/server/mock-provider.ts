@@ -23,9 +23,9 @@ type Intent =
   | { kind: "tool"; name: string; args: Record<string, unknown> }
   | { kind: "write"; path: string }
   | { kind: "consult" }
-  | { kind: "handoff" };
+  | { kind: "handoff" }
+  | { kind: "read"; id: string };
 
-const lastPrefixByModel = new Map<string, string>();
 
 function userText(request: CompletionRequest): string {
   return request.messages.find((message) => message.role === "user")?.content ?? "";
@@ -49,17 +49,15 @@ function overlap(a: string, b: string): number {
 }
 
 function usage(request: CompletionRequest, content: string): CompletionResult["usage"] {
-  const system = systemText(request);
   const promptTokens =
     request.messages.reduce(
       (sum, message) =>
         sum + estimateTokens(message.content ?? "") + estimateTokens(message.toolCalls ? JSON.stringify(message.toolCalls) : "") + 4,
       0,
     ) + (request.tools?.length ? estimateJsonTokens(request.tools) : 0);
-  // Simulate a server prefix cache: an unchanged system prompt is reused.
-  const cachedPromptTokens = lastPrefixByModel.get(request.model.id) === system ? estimateTokens(system) : 0;
-  lastPrefixByModel.set(request.model.id, system);
-  return { promptTokens, completionTokens: estimateTokens(content), cachedPromptTokens, estimated: false };
+  // The simulator has no tokenizer and no prompt cache: its counts are
+  // estimates and it reports no cache information rather than inventing it.
+  return { promptTokens, completionTokens: estimateTokens(content), cachedPromptTokens: null, estimated: true };
 }
 
 function result(request: CompletionRequest, content: string, toolCalls: ToolCall[] = []): CompletionResult {
@@ -141,6 +139,8 @@ function mockPlan(request: CompletionRequest): CompletionResult {
 function mockReview(request: CompletionRequest): CompletionResult {
   const prompt = userText(request);
   const subject = prompt.split("SUBJECT WORK")[1] ?? "";
+  // Test hook: a reviewer that answers in prose instead of a verdict.
+  if (subject.includes("[review-garbage]")) return result(request, "I could not inspect the files.");
   const needsRevision = subject.includes("DRAFT-MARKER");
   return result(
     request,
@@ -181,6 +181,7 @@ function parseIntents(objective: string): Intent[] {
   if (write) intents.push({ kind: "write", path: write[1] });
   if (/\[consult\]/i.test(objective)) intents.push({ kind: "consult" });
   if (/\[handoff-now\]/i.test(objective)) intents.push({ kind: "handoff" });
+  for (const match of objective.matchAll(/read artifact ([\w:.-]+)/gi)) intents.push({ kind: "read", id: match[1] });
   return intents;
 }
 
@@ -225,6 +226,11 @@ function nextToolCall(request: CompletionRequest, objective: string): ToolCall |
   const matches = (candidate: string, wanted: string) => candidate === wanted || candidate.endsWith(`__${wanted}`);
 
   for (const intent of parseIntents(objective)) {
+    if (intent.kind === "read") {
+      const done = history.some((call) => call.name === "read_artifact" && call.args.id === intent.id);
+      if (!native.has("read_artifact") || done) continue;
+      return callOf("read_artifact", { id: intent.id });
+    }
     if (intent.kind === "consult") {
       if (!native.has("consult_agent") || history.some((call) => call.name === "consult_agent")) continue;
       return callOf("consult_agent", { agentId: enumOf(request, "consult_agent", "agentId"), question: `What should I watch out for in: ${objective}` });

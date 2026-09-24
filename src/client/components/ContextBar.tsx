@@ -15,7 +15,8 @@ export const segmentMeta: Record<ContextSegmentKind, { label: string; color: str
   memory: { label: "Memory", color: "#5fd0c0", hint: "Retrieved notes from connected memory." },
   dependencies: { label: "Dependencies", color: "#ff7fc4", hint: "Specialist outputs, advice, verdicts, revision requests." },
   inbox: { label: "Inbox", color: "#b9a9ff", hint: "Status reports delivered to this agent." },
-  tool_results: { label: "Tool loop", color: "#ff8d75", hint: "Tool calls and results accumulated in this request." },
+  tool_results: { label: "Tool loop", color: "#ff8d75", hint: "Tool calls and results in this request, fitted to the window (older results may be elided)." },
+  response_schema: { label: "Response schema", color: "#9aa7b8", hint: "JSON schema sent with plan and review requests." },
 };
 
 export type BarSegment = { kind: ContextSegmentKind; label: string; tokens: number; trimmed?: boolean };

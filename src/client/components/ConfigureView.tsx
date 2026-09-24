@@ -40,7 +40,7 @@ import {
   suggestedRelationship,
   validateTopology,
 } from "../../shared/topology.js";
-import { catalogFor } from "../../shared/capabilities.js";
+import { connectorFingerprint } from "../../shared/capabilities.js";
 import { estimateAgentFootprint, type AgentFootprint } from "../../shared/prompt.js";
 import { api } from "../api.js";
 import { createNode, edgeStyle, nodeMeta, relationshipColor } from "../node-meta.js";
@@ -441,7 +441,7 @@ export function ConfigureView({ topology, runtime, catalogs, onCatalog, onSave, 
           onDelete={deleteSelected}
           onTestModel={testModel}
           footprint={selectedNode ? footprints.get(selectedNode.id) ?? null : null}
-          catalog={selectedNode?.kind === "connector" ? catalogFor(selectedNode, catalogs) : null}
+          catalog={selectedNode?.kind === "connector" ? (catalogs.find((item) => item.connectorId === selectedNode.id && item.fingerprint === connectorFingerprint(selectedNode)) ?? null) : null}
           onDiscover={discover}
         />
       </aside>

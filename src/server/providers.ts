@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   CompletionRequest,
   CompletionResult,
@@ -145,6 +145,26 @@ async function openAICompatibleCompletion(
       estimated: payload.usage?.prompt_tokens === undefined,
     },
   };
+}
+
+/**
+ * Hash of everything in a request that precedes the dynamic messages, as the
+ * server receives it: provider, endpoint, model, system message, tools that
+ * are actually sent, and any JSON response schema. Two requests with equal
+ * hashes share a byte-identical prefix; whether the backend reuses its cache
+ * is only known from server-reported cached tokens.
+ */
+export function requestPrefixHash(request: Pick<CompletionRequest, "model" | "messages" | "tools" | "jsonSchema">): string {
+  const system = request.messages.find((message) => message.role === "system")?.content ?? "";
+  const payload = JSON.stringify([
+    request.model.config.provider,
+    request.model.config.baseUrl,
+    request.model.config.modelId,
+    system,
+    request.jsonSchema ? null : (request.tools ?? []),
+    request.jsonSchema ?? null,
+  ]);
+  return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
 
 export async function complete(request: CompletionRequest): Promise<CompletionResult> {

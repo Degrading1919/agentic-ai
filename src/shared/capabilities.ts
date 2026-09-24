@@ -1,8 +1,10 @@
 import type {
   AgentNode,
   CapabilityNode,
+  CatalogTool,
   ConnectorCatalog,
   ConnectorNode,
+  EffectClass,
   StorageNode,
   ToolDefinition,
   TopologyEdge,
@@ -40,6 +42,14 @@ export type ToolDescriptor = {
   description: string;
   parameters: Record<string, unknown>;
   readOnly: boolean;
+  /**
+   * Recovery class of a call: `none` (no external effect), `idempotent`
+   * (safe to repeat with the same operation ID), or `effectful` (repeating
+   * could duplicate an effect). HTTP descriptors refine this per method.
+   */
+  effect: EffectClass;
+  /** MCP tools: the definition hash the exposed schema came from. */
+  schemaHash?: string;
   source: ToolSource;
 };
 
@@ -85,8 +95,8 @@ export function firstSentence(text: string, maxLength = 110): string {
 
 /** Identity of a connector configuration; a catalog is stale when it changes. */
 export function connectorFingerprint(connector: ConnectorNode): string {
-  const { connectorType, transport, endpoint, command, args } = connector.config;
-  return stableHash(JSON.stringify([connectorType, transport, endpoint, command, args]));
+  const { connectorType, transport, endpoint, command, args, authEnv } = connector.config;
+  return stableHash(JSON.stringify([connectorType, transport, endpoint, command, args, authEnv]));
 }
 
 export function catalogFor(
@@ -98,9 +108,43 @@ export function catalogFor(
   const fingerprint = connectorFingerprint(connector);
   return (
     catalogs.find(
-      (candidate) => candidate.connectorId === connector.id && candidate.fingerprint === fingerprint,
+      (candidate) =>
+        candidate.connectorId === connector.id && candidate.fingerprint === fingerprint && !candidate.error,
     ) ?? null
   );
+}
+
+export type ToolTrust = {
+  access: "read" | "write";
+  idempotent: boolean;
+  /**
+   * `trusted`: a local policy matches the current definition.
+   * `unreviewed`: no local policy; treated as an effectful write tool.
+   * `drifted`: a policy exists but the server's definition changed since.
+   */
+  status: "trusted" | "unreviewed" | "drifted";
+};
+
+/**
+ * Local trust for one MCP tool. Server annotations (readOnlyHint) are
+ * advisory metadata; only a local policy pinned to the tool's current
+ * definition hash can make a tool read-only or retry-safe.
+ */
+export function trustFor(connector: ConnectorNode, tool: Pick<CatalogTool, "name" | "schemaHash">): ToolTrust {
+  const policy = connector.config.trustPolicies.find((candidate) => candidate.name === tool.name);
+  if (!policy) return { access: "write", idempotent: false, status: "unreviewed" };
+  if (!tool.schemaHash || policy.schemaHash !== tool.schemaHash) {
+    return { access: "write", idempotent: false, status: "drifted" };
+  }
+  return { access: policy.access, idempotent: policy.idempotent, status: "trusted" };
+}
+
+/** Effect class of an HTTP request by method, per RFC 9110 and the connector's idempotency support. */
+export function httpEffect(method: string, connector: ConnectorNode): EffectClass {
+  const upper = method.toUpperCase();
+  if (upper === "GET") return "none";
+  if (upper === "PUT" || upper === "DELETE") return "idempotent";
+  return connector.config.honorsIdempotencyKey ? "idempotent" : "effectful";
 }
 
 export const calculatorTool = {
@@ -161,6 +205,7 @@ function storageDescriptors(
           required: ["query"],
         },
         readOnly: true,
+        effect: "none",
         source: source("search"),
       });
     }
@@ -180,6 +225,8 @@ function storageDescriptors(
           required: ["text"],
         },
         readOnly: false,
+        // Appends are keyed by operation ID, so a retry returns the same entry.
+        effect: "idempotent",
         source: source("remember"),
       });
     }
@@ -199,6 +246,7 @@ function storageDescriptors(
           properties: { path: { type: "string", maxLength: 500 } },
         },
         readOnly: true,
+        effect: "none",
         source: source("list"),
       },
       {
@@ -213,6 +261,7 @@ function storageDescriptors(
           required: ["path"],
         },
         readOnly: true,
+        effect: "none",
         source: source("read"),
       },
     );
@@ -233,6 +282,8 @@ function storageDescriptors(
         required: ["path", "content"],
       },
       readOnly: false,
+      // Whole-file replace: repeating the same write yields the same file.
+      effect: "idempotent",
       source: source("write"),
     });
   }
@@ -272,6 +323,11 @@ function connectorDescriptors(
           required: ["method", "path"],
         },
         readOnly: methods.every((method) => method === "GET"),
+        effect: methods.some((method) => httpEffect(method, connector) === "effectful")
+          ? "effectful"
+          : methods.some((method) => httpEffect(method, connector) === "idempotent")
+            ? "idempotent"
+            : "none",
         source: { kind: "http", nodeId: connector.id },
       },
     ];
@@ -282,10 +338,12 @@ function connectorDescriptors(
   const allowlist = new Set(connector.config.toolAllowlist);
   return [...catalog.tools]
     .filter((tool) => allowlist.size === 0 || allowlist.has(tool.name))
-    // Read-only work (consult, review) may use only tools the server marks read-only.
-    .filter((tool) => mode === "full" || tool.readOnly)
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((tool) => ({
+    .map((tool) => ({ tool, trust: trustFor(connector, tool) }))
+    // Read-only work (consult, review) may use only tools the *local* policy
+    // marks read-only for their current definition; server hints never suffice.
+    .filter(({ trust }) => mode === "full" || trust.access === "read")
+    .sort((a, b) => a.tool.name.localeCompare(b.tool.name))
+    .map(({ tool, trust }) => ({
       name: uniqueName(`mcp_${slug}__${tool.name}`, used),
       group,
       summary: firstSentence(tool.description || tool.title || tool.name),
@@ -294,7 +352,9 @@ function connectorDescriptors(
         tool.inputSchema && typeof tool.inputSchema === "object"
           ? tool.inputSchema
           : { type: "object", properties: {} },
-      readOnly: tool.readOnly,
+      readOnly: trust.access === "read",
+      effect: trust.access === "read" ? "none" : trust.idempotent ? "idempotent" : "effectful",
+      schemaHash: tool.schemaHash,
       source: { kind: "mcp", nodeId: connector.id, toolName: tool.name },
     }));
 }
@@ -322,6 +382,7 @@ export function resolveToolDescriptors(
         description: calculatorTool.description,
         parameters: structuredClone(calculatorTool.parameters) as Record<string, unknown>,
         readOnly: true,
+        effect: "none",
         source: { kind: "builtin", nodeId: capability.id, capabilityId: "calculator" },
       });
     }

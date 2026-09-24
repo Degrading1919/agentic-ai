@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import {
   ArrowRight,
   ArrowUp,
+  CircleAlert,
   Bot,
   Check,
   ChevronRight,
@@ -67,11 +68,19 @@ function agentName(topology: Topology, id: string | null): string {
 function plainText(markdown: string): string {
   return markdown
     .replace(/^#{1,6}\s+/gm, "")
-    .replace(/[*_`>]+/g, "")
+    // Keep underscores: identifiers such as tool names contain them.
+    .replace(/[*`>]+/g, "")
     .replace(/^\s*[-+]\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
 }
+
+const reviewOutcomeLabels: Record<NonNullable<WorkOrder["reviewOutcome"]>, string> = {
+  approved: "reviewed",
+  revise_unresolved: "revisions unresolved",
+  rejected: "review rejected",
+  indeterminate: "unreviewed",
+};
 
 function relationColor(name: RelationshipName): string {
   const kind = relationshipKindFor(name);
@@ -84,6 +93,7 @@ function StatusIcon({ status }: { status: WorkOrder["status"] }) {
   if (status === "waiting") return <Clock3 size={12} />;
   if (status === "handed_off") return <ArrowRight size={12} />;
   if (status === "superseded") return <GitBranch size={12} />;
+  if (status === "awaiting_reconciliation") return <CircleAlert size={12} />;
   if (status === "failed" || status === "blocked") return <X size={12} />;
   return <CirclePause size={12} />;
 }
@@ -157,7 +167,13 @@ function OrderCard({
         <RelationBadge name={order.returnRelationship} />
         {order.revisionOf && <span className="order-flag">revision</span>}
         {!order.blocking && <span className="order-flag" title="Advice only; failure does not fail the requester.">advisory</span>}
-        {order.verdict && <span className={`verdict-chip ${order.verdict.verdict}`}>{order.verdict.verdict}</span>}
+        {order.verdict && <span className={`verdict-chip ${order.verdict.verdict}`}>{order.verdict.verdict === "indeterminate" ? "review failed" : order.verdict.verdict}</span>}
+        {order.reviewOutcome && order.reviewOutcome !== "approved" && (
+          <span className={`verdict-chip ${order.reviewOutcome}`} title="What independent review concluded about this result">
+            {reviewOutcomeLabels[order.reviewOutcome]}
+          </span>
+        )}
+        {order.reviewOutcome === "approved" && <span className="verdict-chip approve">reviewed</span>}
         <span className="order-status">{order.status === "running" || order.status === "waiting" ? `${order.status} · ${order.phase}` : order.status.replace("_", " ")}</span>
       </div>
       <p>{plainText(order.summary ?? order.objective)}</p>
@@ -205,13 +221,23 @@ function FrameRow({ frame }: { frame: ContextFrame }) {
       <div className="frame-head">
         <span className="frame-purpose">{frame.purpose.replace("_", " ")}</span>
         <span>{frame.exposure === "none" ? "no tools" : `${frame.exposedToolSchemas}/${frame.authorizedTools} schemas · ${frame.exposure}`}</span>
-        <span className={frame.prefixReused ? "reuse yes" : "reuse"} title="Whether this request's stable prefix matched the previous request to the same model.">
-          {frame.prefixReused ? "prefix reused" : "new prefix"}
+        <span
+          className={frame.localPrefixMatch ? "reuse yes" : "reuse"}
+          title="Local check: the serialized request prefix (model, system, tools, response schema) equals the previous request dispatched to this model. Not a cache measurement."
+        >
+          {frame.localPrefixMatch ? "same prefix as previous call" : "prefix changed"}
         </span>
-        {frame.actualPromptTokens !== null && (
-          <span title="Reported by the inference server">
-            {formatTokens(frame.actualPromptTokens)} actual{cached ? ` · ${formatTokens(cached)} cached` : ""}
+        {frame.elidedToolResults > 0 && (
+          <span title="Earlier tool results were replaced by read_artifact references or truncated to fit the window">
+            {frame.elidedToolResults} result{frame.elidedToolResults === 1 ? "" : "s"} elided
           </span>
+        )}
+        {frame.actualPromptTokens !== null ? (
+          <span title="Reported by the inference server">
+            {formatTokens(frame.actualPromptTokens)} reported{frame.cachedPromptTokens !== null ? ` · ${formatTokens(cached)} cached` : " · cache not reported"}
+          </span>
+        ) : (
+          <span title="The server did not report token usage; values are the harness's estimate">usage not reported</span>
         )}
       </div>
       <ContextBar segments={frame.segments} window={frame.contextWindow} reserved={frame.reservedOutputTokens} compact />
@@ -222,6 +248,7 @@ function FrameRow({ frame }: { frame: ContextFrame }) {
 function OrderDetail({ order, run, topology }: { order: WorkOrder; run: Run; topology: Topology }) {
   const frames = run.contextFrames.filter((frame) => frame.workOrderId === order.id);
   const latest = frames.at(-1);
+  const calls = run.toolCalls.filter((call) => call.workOrderId === order.id);
   const content = order.result ?? order.draft;
   return (
     <section className="order-detail">
@@ -246,6 +273,20 @@ function OrderDetail({ order, run, topology }: { order: WorkOrder; run: Run; top
           ))}
         </ul>
       )}
+      {calls.length > 0 && (
+        <div className="ledger">
+          <div className="section-label"><Workflow size={12} /> Tool calls (durable ledger)</div>
+          {calls.map((call) => (
+            <div key={call.id} className={`ledger-row ${call.status}`}>
+              <span className="ledger-status">{call.status.replaceAll("_", " ")}</span>
+              <strong>{call.targetName}</strong>
+              <span title="none: no external effect · idempotent: safe to repeat with the same operation ID · effectful: repeating could duplicate the effect">{call.effect}</span>
+              {call.attempts > 1 && <span>{call.attempts} attempts</span>}
+              {call.note && <em>{call.note}</em>}
+            </div>
+          ))}
+        </div>
+      )}
       {latest && (
         <div className="frame-section">
           <div className="section-label"><Layers size={12} /> Context per model call</div>
@@ -258,26 +299,96 @@ function OrderDetail({ order, run, topology }: { order: WorkOrder; run: Run; top
   );
 }
 
+/** Human decisions for tool calls whose outcome is unknown after an interruption. */
+function ReconciliationPanel({
+  run,
+  topology,
+  onRunChanged,
+  notify,
+}: {
+  run: Run;
+  topology: Topology;
+  onRunChanged: (run: Run) => void;
+  notify: (tone: "success" | "error" | "info", message: string) => void;
+}) {
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const uncertain = run.toolCalls.filter((call) => call.status === "indeterminate");
+  if (uncertain.length === 0) return null;
+  const decide = async (operationId: string, applied: boolean) => {
+    try {
+      onRunChanged(await api.reconcileToolCall(run.id, operationId, applied, notes[operationId] ?? ""));
+      notify("info", applied ? "Recorded as applied." : "Recorded as not applied; the worker will decide whether to retry.");
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : String(error));
+    }
+  };
+  return (
+    <section className="reconcile-panel">
+      <div className="section-label"><CircleAlert size={12} /> Needs reconciliation</div>
+      <p>
+        These calls were in flight when the run stopped. They may or may not have taken effect, and repeating them could
+        duplicate the effect, so the harness will not retry them on its own. Check the external system, then record what happened.
+      </p>
+      {uncertain.map((call) => (
+        <div className="reconcile-row" key={call.id}>
+          <div>
+            <strong>{call.targetName}</strong>
+            <span>{agentName(topology, call.agentId)} · operation {call.id.slice(0, 8)} · {call.attempts} attempt{call.attempts === 1 ? "" : "s"}</span>
+            <code>{call.argumentsPreview}</code>
+          </div>
+          <input
+            placeholder="What you found (optional, shown to the worker)"
+            value={notes[call.id] ?? ""}
+            onChange={(event) => setNotes((current) => ({ ...current, [call.id]: event.target.value }))}
+          />
+          <div className="reconcile-actions">
+            <button className="secondary-button" onClick={() => void decide(call.id, true)}>It took effect</button>
+            <button className="secondary-button" onClick={() => void decide(call.id, false)}>It did not</button>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
 function ContextSummary({ run }: { run: Run }) {
   const { metrics } = run;
   const used = new Set(run.workOrders.map((order) => order.assigneeAgentId));
   const available = new Set([run.entryAgentId, ...run.plans.flatMap((plan) => plan.available.map((item) => item.agentId))]);
-  const reuse = metrics.modelCalls ? Math.round((metrics.prefixReuses / metrics.modelCalls) * 100) : 0;
-  const cachedShare = metrics.promptTokens ? Math.round((metrics.cachedPromptTokens / metrics.promptTokens) * 100) : 0;
+  const localMatches = metrics.modelCalls ? Math.round((metrics.localPrefixMatches / metrics.modelCalls) * 100) : 0;
+  const cachedShare =
+    metrics.cacheReportedCalls > 0 && metrics.promptTokens > 0
+      ? `${Math.round((metrics.cachedPromptTokens / metrics.promptTokens) * 100)}%`
+      : "n/a";
   return (
     <div className="context-summary">
       <div><strong>{used.size}/{available.size}</strong><span>agents used</span></div>
       <div><strong>{metrics.modelCalls}</strong><span>model calls</span></div>
       <div><strong>{formatTokens(metrics.estimatedPromptTokens)}</strong><span>context sent (est.)</span></div>
-      <div><strong>{formatTokens(metrics.promptTokens)}</strong><span>prompt tokens</span></div>
-      <div title="Share of prompt tokens the server reported as served from its prefix cache"><strong>{cachedShare}%</strong><span>cache hits</span></div>
-      <div title="Requests whose stable prefix matched the previous request to the same model"><strong>{reuse}%</strong><span>prefix reuse</span></div>
+      <div title={`Server-reported prompt tokens (${metrics.usageReportedCalls} of ${metrics.modelCalls} calls reported usage)`}>
+        <strong>{metrics.usageReportedCalls > 0 ? formatTokens(metrics.promptTokens) : "n/a"}</strong><span>reported prompt tokens</span>
+      </div>
+      <div title={`Share of reported prompt tokens the server served from its cache (${metrics.cacheReportedCalls} calls reported cache data)`}>
+        <strong>{cachedShare}</strong><span>server cache hits</span>
+      </div>
+      <div title="Calls whose serialized request prefix equalled the previous call to the same model. A local signal, not a cache measurement.">
+        <strong>{localMatches}%</strong><span>stable prefix (local)</span>
+      </div>
     </div>
   );
 }
 
+const residencyLabels: Record<RuntimeSnapshot["models"][number]["residencyControl"], string> = {
+  "llama-swap": "physical (llama-swap)",
+  logical: "logical only (external server)",
+  simulated: "simulated",
+};
+
 function RuntimePanel({ runtime }: { runtime: RuntimeSnapshot | null }) {
   if (!runtime) return <aside className="runtime-panel">Runtime snapshot unavailable.</aside>;
+  const resident = runtime.models.filter((model) => !["unloaded", "failed"].includes(model.state));
+  const accountedRam = resident.reduce((sum, model) => sum + model.estimatedMemoryMb, 0);
+  const accountedVram = resident.reduce((sum, model) => sum + model.estimatedVramMb, 0);
   const ramPercent = Math.min(100, (runtime.hardware.usedRamMb / runtime.hardware.totalRamMb) * 100);
   const gpu = runtime.hardware.gpu;
   return (
@@ -308,6 +419,10 @@ function RuntimePanel({ runtime }: { runtime: RuntimeSnapshot | null }) {
         ) : (
           <div className="metric-row" title={gpu.reason}><MonitorCog size={15} /><span>GPU</span><strong>unavailable</strong></div>
         )}
+        <div className="metric-row" title="Scheduler accounting from model estimates, compared with the budgets. Observed usage above comes from the OS and nvidia-smi.">
+          <Gauge size={15} /><span>Accounted</span>
+          <strong>{(accountedRam / 1024).toFixed(1)} GB{runtime.vramBudgetMb !== null ? ` · ${(accountedVram / 1024).toFixed(1)} GB VRAM` : ""}</strong>
+        </div>
         <div className="metric-row"><Gauge size={15} /><span>Residency budget</span><strong>{(runtime.memoryBudgetMb / 1024).toFixed(1)} GB{runtime.vramBudgetMb !== null ? ` · ${(runtime.vramBudgetMb / 1024).toFixed(1)} GB VRAM` : ""}</strong></div>
       </div>
 
@@ -332,9 +447,14 @@ function RuntimePanel({ runtime }: { runtime: RuntimeSnapshot | null }) {
                 <span className={`model-state ${model.state}`} />
                 <div>
                   <strong>{model.modelName}</strong>
-                  <span>{model.state} · {model.activeRequests}/{model.parallelSlots} slots{model.waitingRequests ? ` · ${model.waitingRequests} waiting` : ""} · {model.requestCount} calls</span>
+                  <span>
+                    {model.state} · {model.activeRequests}/{model.parallelSlots} slots{model.waitingRequests ? ` · ${model.waitingRequests} waiting` : ""} · {residencyLabels[model.residencyControl]}
+                    {model.reconfigurePending ? " · reconfiguring after current requests" : ""}
+                  </span>
                 </div>
-                <small>{model.estimatedMemoryMb} MB{model.estimatedVramMb ? ` · ${model.estimatedVramMb} V` : ""}</small>
+                <small title={model.vramEstimateKnown ? "Accounted from the model's estimates" : "VRAM estimate unknown: the whole GPU budget is reserved"}>
+                  {model.estimatedMemoryMb} MB{model.estimatedVramMb ? ` · ${model.estimatedVramMb} V${model.vramEstimateKnown ? "" : "?"}` : ""}
+                </small>
               </div>
             ))
           )}
@@ -464,9 +584,16 @@ export function WorkView({ topology, runs, runtime, onRunChanged, notify }: Prop
           </div>
           {summary && status && (
             <div className="run-actions">
-              <span className={`run-badge ${status}`}>{status}</span>
+              <span className={`run-badge ${status}`} title={selectedRun?.pauseReason ?? undefined}>
+                {status === "paused" && selectedRun && !selectedRun.quiescedAt ? "pausing…" : status}
+              </span>
               {["queued", "running", "paused"].includes(status) && (
-                <button className="secondary-button" onClick={() => void pauseOrResume()}>
+                <button
+                  className="secondary-button"
+                  disabled={status === "paused" && Boolean(selectedRun?.toolCalls.some((call) => call.status === "indeterminate"))}
+                  title={status === "paused" && selectedRun?.toolCalls.some((call) => call.status === "indeterminate") ? "Reconcile uncertain tool calls first" : undefined}
+                  onClick={() => void pauseOrResume()}
+                >
                   {status === "paused" ? <Play size={14} /> : <Pause size={14} />}
                   {status === "paused" ? "Resume" : "Pause"}
                 </button>
@@ -532,6 +659,16 @@ export function WorkView({ topology, runs, runtime, onRunChanged, notify }: Prop
                 </div>
               )}
 
+              <ReconciliationPanel run={selectedRun} topology={topology} onRunChanged={onRunChanged} notify={notify} />
+              {selectedRun.status === "paused" && selectedRun.pauseReason && (
+                <div className="active-run-note">
+                  <CirclePause size={17} />
+                  <div>
+                    <strong>{selectedRun.quiescedAt ? "Quiescent: nothing is in flight" : "Pausing: waiting for in-flight work to drain"}</strong>
+                    <span>{selectedRun.pauseReason}</span>
+                  </div>
+                </div>
+              )}
               {selectedRun.metrics.modelCalls > 0 && <ContextSummary run={selectedRun} />}
 
               {selectedRun.reports.length > 0 && (

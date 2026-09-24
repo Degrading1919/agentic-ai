@@ -11,6 +11,7 @@ import type {
   TopologyNode,
 } from "../../shared/contracts.js";
 import type { AgentFootprint } from "../../shared/prompt.js";
+import { trustFor } from "../../shared/capabilities.js";
 import { estimateJsonTokens, estimateTokens, formatTokens } from "../../shared/tokens.js";
 import {
   collaborationKinds,
@@ -179,9 +180,14 @@ function ModelFields({ node, onUpdate, onTest }: { node: ModelNode; onUpdate: (n
     setInspecting(true);
     setInspectResult(null);
     try {
-      const result = await api.inspectModel(artifact.path, node.config.contextWindow);
+      const result = await api.inspectModel(artifact.path, {
+        contextWindow: node.config.contextWindow,
+        gpuLayers: artifact.gpuLayers,
+        parallelSlots: node.config.parallelSlots,
+      });
       set({
         estimatedMemoryMb: result.estimatedMemoryMb,
+        estimatedVramMb: result.estimatedVramMb,
         artifact: {
           ...artifact,
           format: "gguf",
@@ -194,7 +200,7 @@ function ModelFields({ node, onUpdate, onTest }: { node: ModelNode; onUpdate: (n
       });
       setInspectResult({
         ok: true,
-        message: `${result.name}: ${result.architecture} ${result.parameterLabel} ${result.quantization} · ${result.fileSizeMb} MB weights + ${result.kvCacheMb} MB KV @ ${result.contextWindowForEstimate} ctx${result.isAdapter ? " · LoRA adapter" : ""}`,
+        message: `${result.name}: ${result.architecture} ${result.parameterLabel} ${result.quantization} · ≈${result.estimatedMemoryMb} MB RAM, ≈${result.estimatedVramMb} MB VRAM${result.isAdapter ? " · LoRA adapter" : ""}. ${result.assumptions}`,
       });
     } catch (error) {
       setInspectResult({ ok: false, message: error instanceof Error ? error.message : String(error) });
@@ -230,7 +236,15 @@ function ModelFields({ node, onUpdate, onTest }: { node: ModelNode; onUpdate: (n
         </div>
         <div className="field-pair">
           <NumberField label="Est. RAM MB" min={0} value={node.config.estimatedMemoryMb} onChange={(estimatedMemoryMb) => set({ estimatedMemoryMb })} />
-          <NumberField label="Est. VRAM MB" min={0} value={node.config.estimatedVramMb} onChange={(estimatedVramMb) => set({ estimatedVramMb })} />
+          <Field label="Est. VRAM MB" hint={isMock ? undefined : "Empty = unknown: the scheduler reserves the whole GPU budget. 0 = CPU only."}>
+            <input
+              type="number"
+              min={0}
+              placeholder="unknown"
+              value={node.config.estimatedVramMb ?? ""}
+              onChange={(event) => set({ estimatedVramMb: event.target.value === "" ? null : Number(event.target.value) })}
+            />
+          </Field>
         </div>
         <div className="field-pair">
           <NumberField label="Idle TTL ms" min={0} value={node.config.idleTtlMs} onChange={(idleTtlMs) => set({ idleTtlMs })} />
@@ -298,6 +312,32 @@ function ConnectorFields({
     // An allowlist equal to the full catalog is stored as "all".
     set({ toolAllowlist: current.size === all.length ? [] : [...current].sort() });
   };
+  /** Local trust is pinned to the definition hash the user is looking at. */
+  const setTrust = (tool: { name: string; schemaHash: string }, patch: { access?: "read" | "write"; idempotent?: boolean }) => {
+    const existing = node.config.trustPolicies.find((policy) => policy.name === tool.name);
+    const next = {
+      name: tool.name,
+      access: patch.access ?? (existing?.schemaHash === tool.schemaHash ? existing.access : "write"),
+      idempotent: patch.idempotent ?? (existing?.schemaHash === tool.schemaHash ? existing.idempotent : false),
+      schemaHash: tool.schemaHash,
+    };
+    const others = node.config.trustPolicies.filter((policy) => policy.name !== tool.name);
+    set({
+      trustPolicies:
+        next.access === "write" && !next.idempotent ? others : [...others, next].sort((a, b) => a.name.localeCompare(b.name)),
+    });
+  };
+  const adoptServerHints = () => {
+    if (!catalog) return;
+    const hinted = catalog.tools.filter((tool) => tool.readOnly);
+    const others = node.config.trustPolicies.filter((policy) => !hinted.some((tool) => tool.name === policy.name));
+    set({
+      trustPolicies: [
+        ...others,
+        ...hinted.map((tool) => ({ name: tool.name, access: "read" as const, idempotent: false, schemaHash: tool.schemaHash })),
+      ].sort((a, b) => a.name.localeCompare(b.name)),
+    });
+  };
 
   return (
     <>
@@ -340,6 +380,22 @@ function ConnectorFields({
         <NumberField label="Timeout ms" min={1000} value={node.config.timeoutMs} onChange={(timeoutMs) => set({ timeoutMs })} />
         <NumberField label="Max result chars" min={256} value={node.config.maxResultChars} onChange={(maxResultChars) => set({ maxResultChars })} />
       </div>
+      {!mcp && (
+        <Toggle
+          label="Server honours Idempotency-Key (POST/PATCH safe to retry)"
+          checked={node.config.honorsIdempotencyKey}
+          onChange={(honorsIdempotencyKey) => set({ honorsIdempotencyKey })}
+        />
+      )}
+      {mcp && (
+        <NumberField
+          label="Catalog re-verify after (ms)"
+          min={10_000}
+          value={node.config.catalogTtlMs}
+          hint="Tools are re-listed and compared with the stored catalog after this interval or a credential change."
+          onChange={(catalogTtlMs) => set({ catalogTtlMs })}
+        />
+      )}
       <Toggle label="Enabled" checked={node.config.enabled} onChange={(enabled) => set({ enabled })} />
 
       {mcp && (
@@ -367,16 +423,49 @@ function ConnectorFields({
                 <span>{catalog.tools.filter((tool) => allowed(tool.name)).length}/{catalog.tools.length} authorized</span>
               </div>
               <div className="catalog-list">
-                {catalog.tools.map((tool) => (
-                  <label key={tool.name} className="catalog-tool" title={tool.description}>
-                    <input type="checkbox" checked={allowed(tool.name)} onChange={(event) => toggleTool(tool.name, event.target.checked)} />
-                    <span>{tool.name}</span>
-                    {tool.readOnly ? <em className="ro">read</em> : tool.destructive ? <em className="destructive">writes</em> : null}
-                    <small>{formatTokens(estimateJsonTokens({ name: tool.name, description: tool.description, parameters: tool.inputSchema }))}</small>
-                  </label>
-                ))}
+                {catalog.tools.map((tool) => {
+                  const trust = trustFor(node, tool);
+                  return (
+                    <div key={tool.name} className="catalog-tool" title={tool.description}>
+                      <input type="checkbox" aria-label={`Authorize ${tool.name}`} checked={allowed(tool.name)} onChange={(event) => toggleTool(tool.name, event.target.checked)} />
+                      <span>{tool.name}</span>
+                      <span className="trust-controls">
+                        <button
+                          className={`trust-chip ${trust.status === "trusted" && trust.access === "read" ? "on" : ""}`}
+                          title="Local decision: this tool only reads. Required for consult/review use."
+                          onClick={() => setTrust(tool, { access: trust.status === "trusted" && trust.access === "read" ? "write" : "read" })}
+                        >
+                          read-only
+                        </button>
+                        <button
+                          className={`trust-chip ${trust.status === "trusted" && trust.idempotent ? "on" : ""}`}
+                          title="Local decision: repeating this call with the same operation ID is safe. Otherwise an interrupted call needs reconciliation."
+                          onClick={() => setTrust(tool, { idempotent: !(trust.status === "trusted" && trust.idempotent) })}
+                        >
+                          retry-safe
+                        </button>
+                        {trust.status === "drifted" && <em className="destructive" title="The server changed this tool since you reviewed it. Local trust no longer applies.">changed</em>}
+                        {tool.readOnly && <em className="hint" title="The server claims this tool is read-only. Advisory only.">server: read</em>}
+                      </span>
+                      <small>{formatTokens(estimateJsonTokens({ name: tool.name, description: tool.description, parameters: tool.inputSchema }))}</small>
+                    </div>
+                  );
+                })}
               </div>
-              <small className="catalog-note">Unchecked tools are not authorized. Token cost is per schema when sent eagerly. Read-only work (consult, review) only sees tools the server marks read-only.</small>
+              {catalog.rejectedTools.length > 0 && (
+                <div className="catalog-rejected">
+                  <strong>{catalog.rejectedTools.length} tool{catalog.rejectedTools.length === 1 ? "" : "s"} rejected by local limits</strong>
+                  {catalog.rejectedTools.slice(0, 8).map((item) => (
+                    <span key={item.name + item.reason}>{item.name}: {item.reason}</span>
+                  ))}
+                </div>
+              )}
+              {catalog.tools.some((tool) => tool.readOnly) && (
+                <button className="secondary-button small" onClick={adoptServerHints}>Trust the server's read-only hints for these definitions</button>
+              )}
+              <small className="catalog-note">
+                Unchecked tools are not authorized. Server annotations are advisory: only tools you mark read-only are available to consult and review work, and only retry-safe tools are repeated automatically after an interruption. Marks are pinned to the current definition and lapse if the server changes it. Revision {catalog.revision.slice(0, 8) || "n/a"}.
+              </small>
             </div>
           )}
         </Section>

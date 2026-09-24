@@ -390,6 +390,38 @@ button.order-card { display: block; width: 100%; color: inherit; text-align: lef
 .metric-row.sub { margin-top: -6px; }
 .runtime-section .muted-copy { margin: 8px 0 0; }
 
+/* Local trust, reconciliation, and ledger (audit remediation) */
+.catalog-tool .trust-controls { display: flex; flex-wrap: wrap; gap: 3px; justify-content: flex-end; }
+.trust-chip { padding: 1px 5px; color: var(--dim); border: 1px solid var(--line-strong); border-radius: 3px; background: transparent; cursor: pointer; font: 7px "DM Mono", monospace; text-transform: uppercase; }
+.trust-chip.on { color: #091006; border-color: var(--lime); background: var(--lime); }
+.catalog-tool em.hint { color: var(--muted); background: var(--surface-2); }
+.catalog-rejected { display: grid; gap: 2px; padding: 7px; border: 1px solid rgba(255, 189, 89, 0.25); border-radius: 6px; color: var(--amber); font-size: 8px; }
+.catalog-rejected span { color: var(--muted); font: 8px "DM Mono", monospace; }
+.verdict-chip.indeterminate, .verdict-chip.revise_unresolved { color: var(--amber); border-color: rgba(255, 189, 89, 0.3); }
+.verdict-chip.rejected { color: var(--red); border-color: rgba(255, 113, 121, 0.3); }
+.order-card.awaiting_reconciliation { border-color: rgba(255, 189, 89, 0.45); box-shadow: inset 0 0 18px rgba(255, 189, 89, 0.05); }
+.status-dot.awaiting_reconciliation { color: var(--amber); }
+.run-badge.awaiting_reconciliation { color: var(--amber); }
+.ledger { display: grid; gap: 4px; }
+.ledger-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font: 8.5px "DM Mono", monospace; }
+.ledger-row strong { color: #cdd5df; font-weight: 500; }
+.ledger-row em { color: var(--muted); font-style: normal; }
+.ledger-status { text-transform: uppercase; }
+.ledger-row.succeeded .ledger-status, .ledger-row.reconciled_applied .ledger-status { color: var(--lime); }
+.ledger-row.failed .ledger-status, .ledger-row.reconciled_not_applied .ledger-status { color: var(--red); }
+.ledger-row.indeterminate { border-color: rgba(255, 189, 89, 0.4); }
+.ledger-row.indeterminate .ledger-status, .ledger-row.started .ledger-status { color: var(--amber); }
+.reconcile-panel { display: grid; gap: 9px; margin: 0 0 20px 42px; padding: 13px; border: 1px solid rgba(255, 189, 89, 0.4); border-radius: 11px; background: rgba(255, 189, 89, 0.05); }
+.reconcile-panel > p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.reconcile-row { display: grid; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: #0a0e14; }
+.reconcile-row > div:first-child { display: grid; gap: 3px; }
+.reconcile-row strong { font-size: 11px; }
+.reconcile-row span { color: var(--dim); font: 8px "DM Mono", monospace; }
+.reconcile-row code { overflow: hidden; color: var(--muted); font: 8.5px "DM Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.reconcile-row input { padding: 7px 9px; color: #dce2e9; border: 1px solid var(--line); border-radius: 6px; background: #090d13; font-size: 10px; }
+.reconcile-actions { display: flex; gap: 6px; }
+.secondary-button:disabled { opacity: 0.45; cursor: not-allowed; }
+
 @media (max-width: 1180px) {
   .work-layout { grid-template-columns: 220px minmax(430px, 1fr); }
   .runtime-panel { display: none; }
@@ -403,7 +435,7 @@ button.order-card { display: block; width: 100%; color: inherit; text-align: lef
   .topbar-actions { display: none; }.topology-select { display: none; }
   .work-layout { grid-template-columns: minmax(0, 1fr); }.run-sidebar { display: none; }
   .context-summary { grid-template-columns: repeat(3, 1fr); }
-  .plan-strip, .work-order-rail, .order-detail, .report-list, .context-summary, .active-run-note, .run-error, .artifact-strip { margin-left: 0; }
+  .plan-strip, .work-order-rail, .order-detail, .report-list, .context-summary, .active-run-note, .run-error, .artifact-strip, .reconcile-panel { margin-left: 0; }
   .configure-layout { grid-template-columns: minmax(0, 1fr); }.palette-panel, .inspector-panel { display: none; }
   .suggestion-grid { grid-template-columns: 1fr; }.work-header { padding-inline: 18px; }
 }

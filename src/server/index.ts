@@ -77,6 +77,8 @@ app.put<{ Params: { topologyId: string }; Body: unknown }>(
     }
     topology.updatedAt = new Date().toISOString();
     const saved = await store.saveTopology(topology);
+    // Model edits re-account residency immediately (or once in-flight requests drain).
+    await runtime.onTopologySaved(saved);
     return { topology: saved, issues: validateTopology(saved) };
   },
 );
@@ -115,6 +117,16 @@ app.post<{ Params: { runId: string } }>("/api/runs/:runId/pause", async (request
   run: await runtime.pauseRun(request.params.runId),
 }));
 
+app.post<{ Params: { runId: string; operationId: string }; Body: unknown }>(
+  "/api/runs/:runId/tool-calls/:operationId/reconcile",
+  async (request) => {
+    const body = z
+      .object({ applied: z.boolean(), note: z.string().max(4_000).default("") })
+      .parse(request.body);
+    return { run: await runtime.reconcileToolCall(request.params.runId, request.params.operationId, body) };
+  },
+);
+
 app.post<{ Params: { runId: string } }>("/api/runs/:runId/resume", async (request) => ({
   run: await runtime.resumeRun(request.params.runId),
 }));
@@ -143,6 +155,8 @@ app.post<{ Params: { topologyId: string; connectorId: string } }>(
         serverVersion: "",
         tools: [],
         error: message,
+        revision: "",
+        rejectedTools: [],
       });
       return reply.status(502).send({ error: message, catalog });
     }
@@ -174,9 +188,19 @@ app.get<{ Params: { topologyId: string } }>(
 
 app.post<{ Body: unknown }>("/api/models/inspect", async (request) => {
   const body = z
-    .object({ path: z.string().trim().min(1).max(2_000), contextWindow: z.number().int().min(512).optional() })
+    .object({
+      path: z.string().trim().min(1).max(2_000),
+      contextWindow: z.number().int().min(512).optional(),
+      gpuLayers: z.number().int().min(-1).optional(),
+      parallelSlots: z.number().int().min(1).max(64).optional(),
+    })
     .parse(request.body);
-  return { inspection: await inspectGguf(body.path, body.contextWindow) };
+  return {
+    inspection: await inspectGguf(body.path, body.contextWindow, {
+      gpuLayers: body.gpuLayers,
+      parallelSlots: body.parallelSlots,
+    }),
+  };
 });
 
 app.post<{ Params: { topologyId: string; modelId: string } }>(

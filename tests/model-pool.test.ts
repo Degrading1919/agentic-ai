@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { ModelPool } from "../src/server/model-pool.js";
+import { createServer } from "node:http";
+import { ModelPool, modelPoolKey } from "../src/server/model-pool.js";
 import { type ModelNode, modelNodeSchema } from "../src/shared/contracts.js";
 
 function mockModel(id = "model-shared", config: Partial<ModelNode["config"]> = {}): ModelNode {
@@ -122,6 +123,132 @@ describe("model pool", () => {
     release();
     await busy;
     expect(pool.canStartNow(second)).toBe(true);
+    await pool.shutdown();
+  });
+});
+
+describe("residency accounting follows configuration (audit A6)", () => {
+  const key = (topology: string, id: string) => modelPoolKey(topology, id);
+
+  it("re-accounts an idle resident model when its saved configuration changes", async () => {
+    const pool = new ModelPool(4_096);
+    await pool.withModel(mockModel("m", { estimatedMemoryMb: 512 }), "run", async () => undefined, undefined, key("t", "m"));
+    expect(pool.snapshot()[0]).toMatchObject({ estimatedMemoryMb: 512, state: "idle" });
+
+    await pool.reconcile("t", [{ key: key("t", "m"), model: mockModel("m", { estimatedMemoryMb: 900 }) }]);
+    // The old residency was released and the numbers describe the saved configuration.
+    expect(pool.snapshot()[0]).toMatchObject({ estimatedMemoryMb: 900, state: "unloaded", reconfigurePending: false });
+    await pool.withModel(mockModel("m", { estimatedMemoryMb: 900 }), "run", async () => undefined, undefined, key("t", "m"));
+    expect(pool.snapshot()[0]).toMatchObject({ estimatedMemoryMb: 900, state: "idle" });
+    await pool.shutdown();
+  });
+
+  it("never runs a request under stale accounting while the old configuration is busy", async () => {
+    const pool = new ModelPool(4_096);
+    const k = key("t", "m");
+    let release = () => {};
+    const events: string[] = [];
+    const oldRequest = pool.withModel(
+      mockModel("m", { estimatedMemoryMb: 512, parallelSlots: 2 }),
+      "run",
+      () => new Promise<void>((resolve) => {
+        events.push("old:start");
+        release = () => {
+          events.push("old:end");
+          resolve();
+        };
+      }),
+      undefined,
+      k,
+    );
+    await pause(40);
+    await pool.reconcile("t", [{ key: k, model: mockModel("m", { estimatedMemoryMb: 900, parallelSlots: 2 }) }]);
+    expect(pool.snapshot()[0]).toMatchObject({ reconfigurePending: true, estimatedMemoryMb: 512 });
+
+    // A new request with the new configuration waits for the old one to drain, despite a free slot.
+    const newRequest = pool.withModel(
+      mockModel("m", { estimatedMemoryMb: 900, parallelSlots: 2 }),
+      "run",
+      async () => {
+        events.push(`new:start@${pool.snapshot()[0]?.estimatedMemoryMb}`);
+      },
+      undefined,
+      k,
+    );
+    await pause(40);
+    expect(events).toEqual(["old:start"]);
+    release();
+    await Promise.all([oldRequest, newRequest]);
+    expect(events).toEqual(["old:start", "old:end", "new:start@900"]);
+    expect(pool.snapshot()[0]).toMatchObject({ estimatedMemoryMb: 900, reconfigurePending: false });
+    await pool.shutdown();
+  });
+
+  it("accounts an unknown VRAM estimate as the whole GPU budget", async () => {
+    const pool = new ModelPool(16_000, undefined, 7_000);
+    const gpuModel = (id: string) =>
+      mockModel(id, { provider: "openai-compatible", baseUrl: "http://127.0.0.1:9/v1", estimatedMemoryMb: 1_000, estimatedVramMb: null });
+    const order: string[] = [];
+    await Promise.all([
+      pool.withModel(gpuModel("a"), "run", async () => {
+        order.push("a:start");
+        await pause(50);
+        order.push("a:end");
+      }, undefined, key("t", "a")),
+      pause(5).then(() =>
+        pool.withModel(gpuModel("b"), "run", async () => {
+          order.push("b:start");
+        }, undefined, key("t", "b")),
+      ),
+    ]);
+    // Two models with unknown VRAM never co-reside on the GPU.
+    expect(order).toEqual(["a:start", "a:end", "b:start"]);
+    const states = pool.snapshot();
+    expect(states.every((state) => state.estimatedVramMb === 7_000 && state.vramEstimateKnown === false)).toBe(true);
+    expect(states.every((state) => state.residencyControl === "logical")).toBe(true);
+
+    // An explicit zero is CPU-only and does not reserve the GPU.
+    expect(pool.vramFor(mockModel("c", { provider: "openai-compatible", estimatedVramMb: 0 }))).toEqual({ mb: 0, known: true });
+    await pool.shutdown();
+  });
+
+  it("unloads the previously loaded llama-swap model when the configuration changes", async () => {
+    const unloads: string[] = [];
+    const server = createServer((request, response) => {
+      unloads.push(request.url ?? "");
+      response.writeHead(200).end("{}");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const pool = new ModelPool(8_000);
+      const swap = (modelId: string) =>
+        mockModel("m", {
+          provider: "openai-compatible",
+          lifecycle: "llama-swap",
+          modelId,
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          estimatedVramMb: 0,
+        });
+      await pool.withModel(swap("coder-v1"), "run", async () => undefined, undefined, key("t", "m"));
+      expect(pool.snapshot()[0]?.residencyControl).toBe("llama-swap");
+      await pool.reconcile("t", [{ key: key("t", "m"), model: swap("coder-v2") }]);
+      expect(unloads).toEqual(["/api/models/unload/coder-v1"]);
+      await pool.shutdown();
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it("tracks the same model node ID in different topologies independently", async () => {
+    const pool = new ModelPool(4_096);
+    await pool.withModel(mockModel("model-demo", { estimatedMemoryMb: 512 }), "run", async () => undefined, undefined, key("one", "model-demo"));
+    await pool.withModel(mockModel("model-demo", { estimatedMemoryMb: 700 }), "run", async () => undefined, undefined, key("two", "model-demo"));
+    const byKey = Object.fromEntries(pool.snapshot().map((state) => [state.modelId, state.estimatedMemoryMb]));
+    expect(byKey).toEqual({ "one/model-demo": 512, "two/model-demo": 700 });
+    // Saving topology "one" without the model retires only its entry.
+    await pool.reconcile("one", []);
+    expect(pool.snapshot().map((state) => state.modelId)).toEqual(["two/model-demo"]);
     await pool.shutdown();
   });
 });

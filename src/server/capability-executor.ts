@@ -10,6 +10,8 @@ export type ToolInvocation = {
   agentId: string;
   topology: Topology;
   signal?: AbortSignal;
+  /** Stable operation ID from the tool-call ledger; used as the idempotency key. */
+  operationId: string;
 };
 
 export type ToolOutcome = {
@@ -61,6 +63,29 @@ export function resolveHttpTarget(
   return target;
 }
 
+/** Read at most `limitBytes` of a response body, cancelling the rest. */
+export async function readBoundedText(response: Response, limitBytes: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (total + value.byteLength > limitBytes) {
+      chunks.push(value.subarray(0, limitBytes - total));
+      truncated = true;
+      await reader.cancel().catch(() => undefined);
+      break;
+    }
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  return truncated ? `${text}\n[…response truncated at ${limitBytes} bytes]` : text;
+}
+
 export class CapabilityExecutor {
   constructor(
     readonly storage: StorageService,
@@ -85,13 +110,17 @@ export class CapabilityExecutor {
       case "mcp": {
         const connector = nodeById(invocation.topology, source.nodeId, "connector");
         if (!connector) throw new Error("Connector is no longer part of the topology.");
-        const outcome = await this.mcp.callTool(connector, source.toolName, asRecord(args), invocation.signal);
+        const outcome = await this.mcp.callTool(connector, source.toolName, asRecord(args), {
+          signal: invocation.signal,
+          operationId: invocation.operationId,
+          expectedSchemaHash: descriptor.schemaHash,
+        });
         return outcome;
       }
       case "http": {
         const connector = nodeById(invocation.topology, source.nodeId, "connector");
         if (!connector) throw new Error("Connector is no longer part of the topology.");
-        return this.executeHttp(descriptor, connector, args, invocation.signal);
+        return this.executeHttp(descriptor, connector, args, invocation.signal, invocation.operationId);
       }
     }
   }
@@ -135,11 +164,14 @@ export class CapabilityExecutor {
       }
       case "remember": {
         const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
-        const entry = await this.storage.remember(node, edge, stringArg(args, "text"), tags, {
-          runId: invocation.runId,
-          workOrderId: invocation.workOrderId,
-          agentId: invocation.agentId,
-        });
+        const entry = await this.storage.remember(
+          node,
+          edge,
+          stringArg(args, "text"),
+          tags,
+          { runId: invocation.runId, workOrderId: invocation.workOrderId, agentId: invocation.agentId },
+          invocation.operationId,
+        );
         return {
           content: `Remembered note ${entry.id}.`,
           isError: false,
@@ -153,7 +185,8 @@ export class CapabilityExecutor {
     descriptor: ToolDescriptor,
     connector: ConnectorNode,
     args: Record<string, unknown>,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    operationId: string,
   ): Promise<ToolOutcome> {
     const method = stringArg(args, "method", "GET").toUpperCase();
     const allowed = (descriptor.parameters.properties as { method?: { enum?: string[] } } | undefined)
@@ -171,6 +204,8 @@ export class CapabilityExecutor {
     }
     const body = method === "GET" ? undefined : stringArg(args, "body") || undefined;
     if (body) headers["content-type"] = body.trim().startsWith("{") ? "application/json" : "text/plain";
+    // Draft-standard idempotency header; servers that honour it make retries safe.
+    if (method !== "GET") headers["idempotency-key"] = operationId;
     const timeout = AbortSignal.timeout(connector.config.timeoutMs);
     const response = await fetch(target, {
       method,
@@ -179,7 +214,7 @@ export class CapabilityExecutor {
       redirect: "manual",
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
-    const text = await response.text();
+    const text = await readBoundedText(response, Math.max(65_536, connector.config.maxResultChars * 4));
     return {
       content: truncateResult(`HTTP ${response.status}\n${text}`, connector.config.maxResultChars),
       isError: !response.ok,

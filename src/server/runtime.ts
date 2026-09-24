@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   type AccessMode,
   type ToolDescriptor,
-  catalogFor,
+  httpEffect,
   isMetaTool,
   resolveToolDescriptors,
   searchDescriptors,
@@ -13,8 +13,12 @@ import type {
   ArtifactRecord,
   ChatMessage,
   CompletionResult,
+  ConnectorCatalog,
+  ConnectorNode,
   ContextFrame,
   CreateRunRequest,
+  EffectClass,
+  ExecutionCheckpoint,
   ModelNode,
   ModelRuntimeState,
   RelationshipName,
@@ -23,13 +27,14 @@ import type {
   RuntimeEvent,
   RuntimeSnapshot,
   ToolCall,
+  ToolCallRecord,
   ToolDefinition,
   Topology,
   WorkOrder,
 } from "../shared/contracts.js";
 import { reviewVerdictSchema, terminalWorkOrderStatuses } from "../shared/contracts.js";
 import { type StablePrefix, buildStablePrefix } from "../shared/prompt.js";
-import { estimateTokens, truncateToTokens } from "../shared/tokens.js";
+import { estimateJsonTokens, estimateTokens, truncateToTokens } from "../shared/tokens.js";
 import {
   type AgentTopologyContext,
   getAgentContext,
@@ -37,18 +42,21 @@ import {
   relationshipKindFor,
   validateTopology,
 } from "../shared/topology.js";
+import { resolveArtifact, resolveThroughHandoff } from "./artifact-policy.js";
 import { CapabilityExecutor } from "./capability-executor.js";
 import {
   type DynamicSegment,
+  type PackedContext,
   buildFrame,
   dynamicSegment,
+  fitToolTail,
   packContext,
   summarize,
-  toolTailTokens,
+  toolTailBudget,
 } from "./context-builder.js";
 import { defaultMemoryBudgetMb, getHardwareSnapshot, gpuMonitor, vramBudgetFrom } from "./hardware.js";
 import { McpManager, truncateResult } from "./mcp.js";
-import { ModelPool } from "./model-pool.js";
+import { ModelPool, modelPoolKey } from "./model-pool.js";
 import {
   PLANNING_INSTRUCTIONS,
   REVIEW_INSTRUCTIONS,
@@ -59,7 +67,7 @@ import {
   planningSchema,
   reviewSchema,
 } from "./planner.js";
-import { complete } from "./providers.js";
+import { complete, requestPrefixHash } from "./providers.js";
 import { StorageService } from "./storage.js";
 import { LocalStore } from "./store.js";
 
@@ -67,11 +75,16 @@ import { LocalStore } from "./store.js";
 export const MAX_DELEGATION_DEPTH = 2;
 const MAX_HANDOFF_CHAIN = 3;
 const MAX_FRAMES_PER_RUN = 400;
+/** Largest tool result kept in the ledger (and readable via read_artifact tool:<id>). */
 const TOOL_RESULT_CHARS = 12_000;
-const ARTIFACT_READ_CHARS = 12_000;
+/** Attempts to obtain a valid structured verdict before a review is indeterminate. */
+export const REVIEW_MAX_ATTEMPTS = 2;
+/** How long pause waits for in-flight work to drain before reporting "draining". */
+const PAUSE_DRAIN_MS = 15_000;
 
 type HandoffRequest = { agentId: string; reason: string; progress: string; remainingWork: string };
 type LoopOutcome = { kind: "result"; text: string } | ({ kind: "handoff" } & HandoffRequest);
+type CallOutcome = { content: string; isError: boolean; handoff?: HandoffRequest; artifact?: ArtifactRecord };
 
 type LoopState = {
   runId: string;
@@ -83,7 +96,16 @@ type LoopState = {
   accessMode: AccessMode;
   loaded: Set<string>;
   signal: AbortSignal;
+  packed?: PackedContext;
 };
+
+/** A tool call's outcome is unknown and it cannot be repeated safely. */
+export class ReconciliationRequired extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReconciliationRequired";
+  }
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -99,6 +121,10 @@ function event(
 
 function isAbort(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
+}
+
+function abortError(): DOMException {
+  return new DOMException("Run paused", "AbortError");
 }
 
 function isTerminal(order: WorkOrder): boolean {
@@ -125,19 +151,23 @@ function sameSource(a: ToolDescriptor["source"], b: ToolDescriptor["source"]): b
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-export function parseVerdict(content: string): ReviewVerdict {
-  try {
-    const json = content.match(/\{[\s\S]*\}/)?.[0] ?? content;
-    return reviewVerdictSchema.parse(JSON.parse(json));
-  } catch {
-    const lower = content.toLowerCase();
-    const verdict = /\breject/.test(lower)
-      ? "reject"
-      : /\b(revise|revision|changes requested|needs work)\b/.test(lower)
-        ? "revise"
-        : "approve";
-    return { verdict, summary: content.slice(0, 4_000), findings: [] };
+/**
+ * Parse a reviewer's output strictly. Only a JSON object that matches the
+ * verdict schema counts; prose, partial JSON, apologies, and the reserved
+ * `indeterminate` value all return null. Review never fails open.
+ */
+export function parseVerdict(content: string): ReviewVerdict | null {
+  const candidates = [content.trim(), content.match(/```(?:json)?\s*([\s\S]*?)```/)?.[1]?.trim(), content.match(/\{[\s\S]*\}/)?.[0]];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const parsed = reviewVerdictSchema.safeParse(JSON.parse(candidate));
+      if (parsed.success && parsed.data.verdict !== "indeterminate") return parsed.data;
+    } catch {
+      // try the next candidate
+    }
   }
+  return null;
 }
 
 export function formatVerdict(verdict: ReviewVerdict): string {
@@ -169,12 +199,52 @@ function envelopeText(order: WorkOrder, topology: Topology): string {
     .join("\n");
 }
 
+/** What independent review concluded for a set of subjects. */
+function reviewOutcomeOf(review: WorkOrder | undefined): WorkOrder["reviewOutcome"] {
+  if (!review) return "indeterminate";
+  if (review.status !== "completed" || !review.verdict || review.verdict.verdict === "indeterminate") {
+    return "indeterminate";
+  }
+  if (review.verdict.verdict === "approve") return "approved";
+  if (review.verdict.verdict === "reject") return "rejected";
+  return "revise_unresolved";
+}
+
+/**
+ * Once nothing is in flight, an effectful call still marked `started` has an
+ * unknown outcome. Flag it for reconciliation and pause its order; calls that
+ * are safe to repeat stay `started` and are retried with the same operation ID.
+ */
+function flagInterruptedEffects(run: Run, reason: string): number {
+  let flagged = 0;
+  for (const record of run.toolCalls) {
+    if (record.status !== "started" || record.effect !== "effectful") continue;
+    record.status = "indeterminate";
+    record.error = "Outcome unknown: interrupted during an effectful call.";
+    flagged += 1;
+    const order = run.workOrders.find((candidate) => candidate.id === record.workOrderId);
+    if (order && (order.status === "running" || order.status === "queued")) order.status = "awaiting_reconciliation";
+    run.events.push(
+      event("tool_call_indeterminate", `${record.targetName} was in flight when ${reason}; it may or may not have taken effect.`, {
+        operationId: record.id,
+        workOrderId: record.workOrderId,
+      }),
+    );
+  }
+  if (flagged > 0 && run.status !== "completed" && run.status !== "failed") {
+    run.status = "paused";
+    run.pauseReason = `${flagged} tool call${flagged === 1 ? " with an unknown outcome needs" : "s with unknown outcomes need"} reconciliation.`;
+    run.events.push(event("reconciliation_required", run.pauseReason));
+  }
+  return flagged;
+}
+
 export class RuntimeEngine {
   private readonly queue: string[] = [];
   private readonly active = new Map<string, Promise<void>>();
   private readonly controllers = new Map<string, AbortController>();
-  /** Last prefix key sent to each model, for observing cache stability. */
-  private readonly lastPrefixByModel = new Map<string, string>();
+  /** Last request prefix dispatched to each model (by pool key). */
+  private readonly lastDispatchedPrefix = new Map<string, string>();
   private activeOrders = 0;
   private readonly maxConcurrentRuns: number;
   readonly maxParallelOrders: number;
@@ -202,7 +272,10 @@ export class RuntimeEngine {
     this.modelPool.vramBudgetMb = vramBudgetFrom(gpu);
     for (const run of this.store.listRuns(10_000)) {
       if (run.status === "running") {
-        await this.store.mutateRun(run.id, (draft) => {
+        // Orders resume from their durable checkpoints. An effectful call that
+        // was in flight when the process stopped is flagged for reconciliation
+        // instead of being replayed; safe calls are retried on resume.
+        const updated = await this.store.mutateRun(run.id, (draft) => {
           draft.status = "queued";
           for (const order of draft.workOrders) {
             if (order.status === "running") {
@@ -211,10 +284,16 @@ export class RuntimeEngine {
             }
           }
           draft.events.push(event("run_resumed", "Recovered queued work after the local runtime restarted."));
+          if (flagInterruptedEffects(draft, "the runtime stopped")) draft.quiescedAt = now();
         });
-        this.enqueue(run.id);
+        if (updated.status === "queued") this.enqueue(run.id);
       } else if (run.status === "queued") {
         this.enqueue(run.id);
+      } else if (run.status === "paused" && !run.quiescedAt) {
+        // Nothing can be in flight in a freshly started process.
+        await this.store.mutateRun(run.id, (draft) => {
+          draft.quiescedAt = now();
+        });
       }
     }
   }
@@ -240,6 +319,16 @@ export class RuntimeEngine {
       vramBudgetMb: this.modelPool.vramBudgetMb,
       maxParallelOrders: this.maxParallelOrders,
     };
+  }
+
+  /** Re-account model residency after a topology save (audit A6). */
+  async onTopologySaved(topology: Topology): Promise<void> {
+    await this.modelPool.reconcile(
+      topology.id,
+      topology.nodes
+        .filter((node): node is ModelNode => node.kind === "model")
+        .map((model) => ({ key: modelPoolKey(topology.id, model.id), model })),
+    );
   }
 
   // ---------------------------------------------------------------- runs
@@ -297,6 +386,9 @@ export class RuntimeEngine {
       summary: null,
       verdict: null,
       draft: null,
+      reviewOutcome: null,
+      checkpoint: null,
+      ownerOperationId: null,
     };
     const run: Run = {
       id,
@@ -320,7 +412,9 @@ export class RuntimeEngine {
         elapsedMs: 0,
         cachedPromptTokens: 0,
         estimatedPromptTokens: 0,
-        prefixReuses: 0,
+        localPrefixMatches: 0,
+        usageReportedCalls: 0,
+        cacheReportedCalls: 0,
       },
       createdAt,
       updatedAt: createdAt,
@@ -332,31 +426,61 @@ export class RuntimeEngine {
       plans: [],
       reports: [],
       artifacts: [],
+      toolCalls: [],
+      quiescedAt: null,
+      pauseReason: null,
     };
     await this.store.createRun(run);
     this.enqueue(id);
     return this.store.getRun(id) ?? run;
   }
 
+  /**
+   * Pause is a quiescence barrier: no new tool effect is dispatched after the
+   * abort, in-flight provider/MCP/HTTP requests are cancelled, and the call
+   * returns once the run's worker has drained (or reports `quiescedAt: null`
+   * while a non-cancellable effect is still finishing). Effects interrupted
+   * mid-flight are classified on resume, never silently repeated.
+   */
   async pauseRun(runId: string): Promise<Run> {
     const existing = this.store.getRun(runId);
     if (!existing) throw new Error("Run does not exist.");
     if (["completed", "failed"].includes(existing.status)) return existing;
     this.removeFromQueue(runId);
-    const updated = await this.store.mutateRun(runId, (run) => {
+    const task = this.active.get(runId);
+    await this.store.mutateRun(runId, (run) => {
       run.status = "paused";
-      run.events.push(event("run_paused", "Run paused; completed work has been preserved."));
+      run.pauseReason = run.pauseReason ?? "Paused by the user.";
+      run.quiescedAt = task ? null : (run.quiescedAt ?? now());
+      run.events.push(event("run_paused", "Run paused; no new tool effects will start. Completed work is preserved."));
     });
     this.controllers.get(runId)?.abort();
-    return updated;
+    if (task) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        task.catch(() => undefined),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, PAUSE_DRAIN_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+    return this.store.getRun(runId) ?? existing;
   }
 
   async resumeRun(runId: string): Promise<Run> {
     const existing = this.store.getRun(runId);
     if (!existing) throw new Error("Run does not exist.");
     if (existing.status !== "paused") throw new Error("Only paused runs can be resumed.");
+    const unresolved = existing.toolCalls.filter((call) => call.status === "indeterminate");
+    if (unresolved.length > 0) {
+      throw new Error(
+        `Reconcile ${unresolved.length} tool call${unresolved.length === 1 ? "" : "s"} with an unknown outcome before resuming.`,
+      );
+    }
     const updated = await this.store.mutateRun(runId, (run) => {
       run.status = "queued";
+      run.pauseReason = null;
       for (const order of run.workOrders) {
         if (order.status === "running") {
           order.status = "queued";
@@ -369,6 +493,40 @@ export class RuntimeEngine {
     });
     this.enqueue(runId);
     return updated;
+  }
+
+  /**
+   * Record a human decision about a tool call whose outcome was unknown.
+   * `applied` means the effect happened (the note becomes the tool result);
+   * otherwise the worker is told it did not happen and was not retried.
+   */
+  async reconcileToolCall(runId: string, operationId: string, decision: { applied: boolean; note: string }): Promise<Run> {
+    const run = this.store.getRun(runId);
+    const record = run?.toolCalls.find((call) => call.id === operationId);
+    if (!run || !record) throw new Error("Tool call not found.");
+    if (record.status !== "indeterminate") throw new Error("Only tool calls with an unknown outcome can be reconciled.");
+    return this.store.mutateRun(runId, (draft) => {
+      const target = draft.toolCalls.find((call) => call.id === operationId);
+      if (!target) return;
+      target.status = decision.applied ? "reconciled_applied" : "reconciled_not_applied";
+      target.note = decision.note.slice(0, 4_000) || null;
+      target.completedAt = now();
+      const stillUnknown = draft.toolCalls.some(
+        (call) => call.workOrderId === target.workOrderId && call.status === "indeterminate",
+      );
+      const order = draft.workOrders.find((candidate) => candidate.id === target.workOrderId);
+      if (order && order.status === "awaiting_reconciliation" && !stillUnknown) order.status = "queued";
+      if (!draft.toolCalls.some((call) => call.status === "indeterminate")) {
+        draft.pauseReason = "Reconciled; resume to continue.";
+      }
+      draft.events.push(
+        event(
+          "tool_call_reconciled",
+          `${target.targetName} was reconciled as ${decision.applied ? "applied" : "not applied"}.`,
+          { operationId, applied: decision.applied },
+        ),
+      );
+    });
   }
 
   /** Discover and cache an MCP connector's tool catalog. */
@@ -404,9 +562,19 @@ export class RuntimeEngine {
         .catch(async (error) => {
           if (!isAbort(error)) await this.failRun(runId, error);
         })
-        .finally(() => {
+        .finally(async () => {
           this.active.delete(runId);
           this.controllers.delete(runId);
+          const latest = this.store.getRun(runId);
+          if (latest?.status === "paused" && !latest.quiescedAt) {
+            await this.store
+              .mutateRun(runId, (draft) => {
+                draft.quiescedAt = now();
+                draft.events.push(event("run_quiesced", "Paused run is quiescent: no model calls or tool effects are in flight."));
+                flagInterruptedEffects(draft, "the run was paused");
+              })
+              .catch(() => undefined);
+          }
           // A resume can land while a paused run is still unwinding; its
           // enqueue was skipped because the run was active, so pick it up now.
           if (this.store.getRun(runId)?.status === "queued" && !this.queue.includes(runId)) {
@@ -419,25 +587,24 @@ export class RuntimeEngine {
   }
 
   private currentRoot(run: Run): WorkOrder | undefined {
-    let root =
+    const root =
       run.workOrders.find((order) => order.id === run.rootOrderId) ??
       run.workOrders.find((order) => order.parentId === null && order.returnRelationship === "root");
-    const seen = new Set<string>();
-    while (root?.status === "handed_off" && root.handedOffToOrderId && !seen.has(root.id)) {
-      seen.add(root.id);
-      const next = run.workOrders.find((order) => order.id === root?.handedOffToOrderId);
-      if (!next) break;
-      root = next;
-    }
-    return root;
+    return root ? resolveThroughHandoff(run, root.id) : undefined;
   }
 
   private modelFor(topology: Topology, agentId: string): ModelNode | null {
     return getAgentContext(topology, agentId)?.model ?? null;
   }
 
+  /** A dependency is satisfied when the work it names — after any handoff — is finished. */
+  private dependencySatisfied(run: Run, dependency: string): boolean {
+    const target = resolveThroughHandoff(run, dependency);
+    return !target || (isTerminal(target) && target.status !== "handed_off");
+  }
+
   /**
-   * Run-level scheduler. Ready orders (dependencies terminal) start in
+   * Run-level scheduler. Ready orders (dependencies finished) start in
    * priority order. A second order starts concurrently only if its model can
    * take a request right now, so small machines stay sequential and larger
    * ones overlap work. Orders whose model is already resident go first.
@@ -458,20 +625,19 @@ export class RuntimeEngine {
         const topology = this.store.getTopology(run.topologyId);
         if (!topology) throw new Error("Run topology no longer exists.");
 
-        const byId = new Map(run.workOrders.map((order) => [order.id, order]));
         const ready = run.workOrders
           .filter(
             (order) =>
               order.status === "queued" &&
+              // Inline consultations are driven by the tool call that owns them.
+              !order.ownerOperationId &&
               !inFlight.has(order.id) &&
-              order.dependencies.every((dependency) => {
-                const target = byId.get(dependency);
-                return !target || isTerminal(target);
-              }),
+              order.dependencies.every((dependency) => this.dependencySatisfied(run, dependency)),
           )
           .map((order) => {
             const model = this.modelFor(topology, order.assigneeAgentId);
-            return { order, model, loaded: model ? this.modelPool.isLoaded(model.id) : false };
+            const key = model ? modelPoolKey(topology.id, model.id) : "";
+            return { order, model, key, loaded: model ? this.modelPool.isLoaded(key) : false };
           })
           .sort(
             (a, b) =>
@@ -481,9 +647,9 @@ export class RuntimeEngine {
               a.order.id.localeCompare(b.order.id),
           );
 
-        for (const { order, model } of ready) {
+        for (const { order, model, key } of ready) {
           if (inFlight.size >= this.maxParallelOrders) break;
-          if (inFlight.size > 0 && model && !this.modelPool.canStartNow(model)) continue;
+          if (inFlight.size > 0 && model && !this.modelPool.canStartNow(model, key)) continue;
           const task = this.executeWorkOrder(runId, order.id, controller.signal).finally(() => {
             inFlight.delete(order.id);
           });
@@ -505,6 +671,10 @@ export class RuntimeEngine {
         }
         if (root.status === "failed" || root.status === "blocked") {
           await this.failRun(runId, new Error(root.error ?? "Root work order failed."));
+          break;
+        }
+        if (latest.workOrders.some((order) => order.status === "awaiting_reconciliation")) {
+          await this.pauseForReconciliation(runId, "A tool call's outcome must be reconciled before work can continue.");
           break;
         }
         // Nothing is in flight and nothing was startable: only a newly
@@ -535,6 +705,15 @@ export class RuntimeEngine {
       }
     });
     return true;
+  }
+
+  private async pauseForReconciliation(runId: string, reason: string): Promise<void> {
+    await this.store.mutateRun(runId, (draft) => {
+      if (draft.status === "completed" || draft.status === "failed") return;
+      draft.status = "paused";
+      draft.pauseReason = reason;
+      draft.events.push(event("reconciliation_required", reason));
+    });
   }
 
   // -------------------------------------------------------------- orders
@@ -572,6 +751,7 @@ export class RuntimeEngine {
         blocked.status = "blocked";
         blocked.error = denial;
         blocked.completedAt = now();
+        blocked.checkpoint = null;
         draft.events.push(event("topology_boundary", denial, { workOrderId }));
       });
       return;
@@ -597,6 +777,7 @@ export class RuntimeEngine {
     try {
       await this.advanceOrder(runId, workOrderId, signal);
     } catch (error) {
+      if (error instanceof ReconciliationRequired) return;
       if (isAbort(error) || signal.aborted) {
         await this.store.mutateRun(runId, (draft) => {
           const interrupted = draft.workOrders.find((candidate) => candidate.id === workOrderId);
@@ -616,6 +797,7 @@ export class RuntimeEngine {
         failed.error = message;
         failed.completedAt = now();
         failed.phase = "done";
+        failed.checkpoint = null;
         draft.events.push(event("work_order_failed", message, { workOrderId, agentId: failed.assigneeAgentId }));
         this.deliverReports(draft, topology, failed);
       });
@@ -657,39 +839,83 @@ export class RuntimeEngine {
     return this.execute(runId, orderId, signal);
   }
 
-  /** Lazily discover MCP catalogs for enabled connectors before a worker needs them. */
+  /**
+   * Verify MCP catalogs for this process and the current credential before a
+   * worker sees their tools (audit A5). Catalogs expire after the connector's
+   * TTL; drift against the stored catalog is recorded.
+   */
   private async ensureCatalogs(runId: string, context: AgentTopologyContext, signal: AbortSignal) {
-    const catalogs = this.store.listCatalogs();
     for (const connector of context.connectors) {
       if (signal.aborted) return;
       if (!connector.config.enabled || connector.config.connectorType !== "mcp") continue;
-      const catalog = catalogFor(connector, catalogs);
-      if (catalog && !catalog.error) continue;
-      try {
-        const discovered = await this.mcp.discover(connector);
-        await this.store.saveCatalog(discovered);
-        await this.store.mutateRun(runId, (draft) => {
-          draft.events.push(
-            event("capability_loaded", `Discovered ${discovered.tools.length} tools from ${connector.name}.`, {
-              connectorId: connector.id,
-            }),
-          );
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await this.store.mutateRun(runId, (draft) => {
-          draft.events.push(
-            event("topology_boundary", `Connector ${connector.name} is unavailable: ${message}`, {
-              connectorId: connector.id,
-            }),
-          );
-        });
-      }
+      if (this.mcp.isVerified(connector)) continue;
+      await this.refreshCatalog(runId, connector);
     }
   }
 
+  private async refreshCatalog(runId: string, connector: ConnectorNode): Promise<void> {
+    const previous = this.store
+      .listCatalogs()
+      .find((catalog) => catalog.connectorId === connector.id && !catalog.error);
+    try {
+      const discovered = await this.mcp.discover(connector);
+      await this.store.saveCatalog(discovered);
+      const drift = previous ? this.catalogDrift(previous, discovered) : null;
+      await this.store.mutateRun(runId, (draft) => {
+        draft.events.push(
+          event("capability_loaded", `Verified ${discovered.tools.length} tools from ${connector.name}.`, {
+            connectorId: connector.id,
+            revision: discovered.revision,
+            rejected: discovered.rejectedTools.length,
+          }),
+        );
+        if (drift) {
+          draft.events.push(
+            event("catalog_changed", `${connector.name} changed its tools: ${drift}. Local trust decisions for changed tools no longer apply.`, {
+              connectorId: connector.id,
+            }),
+          );
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.store.mutateRun(runId, (draft) => {
+        draft.events.push(
+          event("topology_boundary", `Connector ${connector.name} is unavailable; its tools are withheld: ${message}`, {
+            connectorId: connector.id,
+          }),
+        );
+      });
+    }
+  }
+
+  private catalogDrift(previous: ConnectorCatalog, next: ConnectorCatalog): string | null {
+    if (previous.revision && previous.revision === next.revision) return null;
+    const before = new Map(previous.tools.map((tool) => [tool.name, tool.schemaHash]));
+    const after = new Map(next.tools.map((tool) => [tool.name, tool.schemaHash]));
+    const added = [...after.keys()].filter((name) => !before.has(name));
+    const removed = [...before.keys()].filter((name) => !after.has(name));
+    const changed = [...after.keys()].filter((name) => before.has(name) && before.get(name) !== after.get(name));
+    const parts = [
+      added.length ? `added ${added.slice(0, 5).join(", ")}${added.length > 5 ? "…" : ""}` : "",
+      removed.length ? `removed ${removed.slice(0, 5).join(", ")}${removed.length > 5 ? "…" : ""}` : "",
+      changed.length ? `changed ${changed.slice(0, 5).join(", ")}${changed.length > 5 ? "…" : ""}` : "",
+    ].filter(Boolean);
+    return parts.length ? parts.join("; ") : null;
+  }
+
+  /** Catalogs a worker may see: MCP catalogs only when verified in this process. */
+  private exposableCatalogs(context: AgentTopologyContext): ConnectorCatalog[] {
+    const unverified = new Set(
+      context.connectors
+        .filter((connector) => connector.config.connectorType === "mcp" && !this.mcp.isVerified(connector))
+        .map((connector) => connector.id),
+    );
+    return this.store.listCatalogs().filter((catalog) => !unverified.has(catalog.connectorId));
+  }
+
   private prefixFor(context: AgentTopologyContext, accessMode: AccessMode, allowCollaboration: boolean) {
-    return buildStablePrefix(context, this.store.listCatalogs(), { accessMode, allowCollaboration });
+    return buildStablePrefix(context, this.exposableCatalogs(context), { accessMode, allowCollaboration });
   }
 
   /** Agents on this order's chain of responsibility; never valid new assignees. */
@@ -744,6 +970,7 @@ export class RuntimeEngine {
     ];
     const packed = packContext(prefix, dynamic, model, context.agent);
     const response = await this.callModel(runId, {
+      topologyId: topology.id,
       model,
       agent: context.agent,
       messages: packed.messages,
@@ -851,6 +1078,9 @@ export class RuntimeEngine {
       summary: null,
       verdict: null,
       draft: null,
+      reviewOutcome: null,
+      checkpoint: null,
+      ownerOperationId: null,
       ...patch,
     };
   }
@@ -959,16 +1189,23 @@ export class RuntimeEngine {
     const hasDelegates = latest.workOrders.some(
       (candidate) => candidate.parentId === orderId && candidate.returnRelationship === "delegate",
     );
-    if (
-      reviewer &&
-      !hasDelegates &&
-      hasCollaborationPermission(topology, current.assigneeAgentId, reviewer.agentId, "agent_can_review_agent") &&
-      (ownReviews.length === 0 || lastReview?.verdict?.verdict === "revise")
-    ) {
+    if (reviewer && !hasDelegates && (ownReviews.length === 0 || lastReview?.verdict?.verdict === "revise")) {
+      if (!hasCollaborationPermission(topology, current.assigneeAgentId, reviewer.agentId, "agent_can_review_agent")) {
+        // The plan required review but the relationship is gone: the result is unreviewed, not approved.
+        await this.completeOrder(
+          runId,
+          orderId,
+          topology,
+          `${outcome.text}\n\n## Review could not be completed\n\nThe review relationship was removed before the review ran. This result has not been independently reviewed.`,
+          { reviewOutcome: "indeterminate" },
+        );
+        return;
+      }
       await this.store.mutateRun(runId, (draft) => {
         const parent = draft.workOrders.find((candidate) => candidate.id === orderId);
         if (!parent) return;
         parent.draft = outcome.text;
+        parent.checkpoint = null;
         const review = this.newChild(parent, {
           assigneeAgentId: reviewer.agentId,
           objective: `Review this work against the requirements. Criteria: ${plan?.reviewCriteria || "correctness, risks, and completeness."}`,
@@ -1008,7 +1245,7 @@ export class RuntimeEngine {
       const reviewEdge = hasCollaborationPermission(topology, order.assigneeAgentId, review.assigneeAgentId, "agent_can_review_agent");
       const maxRevisions = reviewEdge?.settings?.maxRevisions ?? 1;
       const subjects = review.subjectOrderIds
-        .map((id) => run.workOrders.find((candidate) => candidate.id === id))
+        .map((id) => resolveThroughHandoff(run, id))
         .filter((subject): subject is WorkOrder => Boolean(subject));
 
       if (subjects.some((subject) => subject.id === orderId)) {
@@ -1056,7 +1293,8 @@ export class RuntimeEngine {
           }
           return revision;
         });
-        const remainingSubjects = review.subjectOrderIds
+        const resolvedSubjects = review.subjectOrderIds.map((id) => resolveThroughHandoff(run, id)?.id ?? id);
+        const remainingSubjects = resolvedSubjects
           .filter((id) => !revisable.some((subject) => subject.id === id))
           .concat(revisions.map((revision) => revision.id));
         const nextReview = this.newChild(parent, {
@@ -1092,16 +1330,27 @@ export class RuntimeEngine {
     if (producing.length > 0) return this.integrateResults(runId, orderId, signal);
 
     if (order.draft) {
-      // Reviewed direct work: finalize without another model call.
-      const ownReview = [...children].reverse().find(
-        (child) => child.returnRelationship === "review" && child.subjectOrderIds.includes(orderId),
-      );
-      const verdict = ownReview?.verdict;
-      const result =
-        !verdict || verdict.verdict === "approve"
-          ? order.draft
-          : `${order.draft}\n\n## Unresolved review notes\n\n${formatVerdict(verdict)}`;
-      return this.completeOrder(runId, orderId, topology, result);
+      // Reviewed direct work. Only an approving verdict finalizes the draft as
+      // reviewed; a failed, missing, or unparseable review fails closed.
+      const ownReview = [...children]
+        .reverse()
+        .find((child) => child.returnRelationship === "review" && child.subjectOrderIds.includes(orderId));
+      const reviewOutcome = reviewOutcomeOf(ownReview);
+      let result = order.draft;
+      if (reviewOutcome === "indeterminate") {
+        const reason = ownReview?.verdict?.summary || ownReview?.error || "No review result was produced.";
+        result = `${order.draft}\n\n## Review could not be completed\n\n${reason}\n\nThis result has not been independently reviewed.`;
+        await this.store.mutateRun(runId, (draft) => {
+          draft.events.push(
+            event("review_indeterminate", `Review of ${agentName(topology, order.assigneeAgentId)}'s work could not be determined; the result is marked unreviewed.`, {
+              workOrderId: orderId,
+            }),
+          );
+        });
+      } else if (reviewOutcome !== "approved" && ownReview?.verdict) {
+        result = `${order.draft}\n\n## Unresolved review notes\n\n${formatVerdict(ownReview.verdict)}`;
+      }
+      return this.completeOrder(runId, orderId, topology, result, { reviewOutcome });
     }
 
     // Consult-only plans: do the work now, with the advice in context.
@@ -1134,7 +1383,7 @@ export class RuntimeEngine {
       dynamicSegment(
         "work_order",
         "Integration request",
-        "INTEGRATION REQUEST\nIntegrate the specialist outputs, advice, and review verdicts above into one result for the expected output. Resolve conflicts explicitly.",
+        "INTEGRATION REQUEST\nIntegrate the specialist outputs, advice, and review verdicts above into one result for the expected output. Resolve conflicts explicitly. Work whose review failed or was not approved must be reported as such, not as reviewed.",
         95,
       ),
     ];
@@ -1148,7 +1397,13 @@ export class RuntimeEngine {
       if (handed) return;
       throw new Error(`Handoff to ${outcome.agentId} is not permitted by the topology.`);
     }
-    await this.completeOrder(runId, orderId, topology, outcome.text);
+    const latest = this.store.getRun(runId) ?? run;
+    const latestReview = latest.workOrders
+      .filter((child) => child.parentId === orderId && child.returnRelationship === "review" && child.status !== "superseded")
+      .at(-1);
+    await this.completeOrder(runId, orderId, topology, outcome.text, {
+      reviewOutcome: latestReview ? reviewOutcomeOf(latestReview) : null,
+    });
   }
 
   private async runConsult(runId: string, orderId: string, signal: AbortSignal): Promise<void> {
@@ -1170,8 +1425,9 @@ export class RuntimeEngine {
   private async runReview(runId: string, orderId: string, signal: AbortSignal): Promise<void> {
     const { run, order, topology, context, model } = this.load(runId, orderId);
     const prefix = this.prefixFor(context, "read-only", false);
+    // Subjects resolve through handoffs to the work that was actually delivered (audit B2).
     const subjects = order.subjectOrderIds
-      .map((id) => run.workOrders.find((candidate) => candidate.id === id))
+      .map((id) => resolveThroughHandoff(run, id))
       .filter((subject): subject is WorkOrder => Boolean(subject));
     const subjectText = subjects
       .map((subject) => {
@@ -1191,28 +1447,70 @@ export class RuntimeEngine {
       dynamicSegment("work_order", "Review request", REVIEW_INSTRUCTIONS, 95),
     ];
     const packed = packContext(prefix, dynamic, model, context.agent);
-    const response = await this.callModel(runId, {
-      model,
-      agent: context.agent,
-      messages: packed.messages,
-      prefix,
-      purpose: "review",
-      order,
-      packed,
-      tailTokens: 0,
-      jsonSchema: reviewSchema(),
-      signal,
-    });
-    const verdict = parseVerdict(response.content);
+
+    // Review fails closed: only a schema-valid verdict counts (audit A4).
+    let verdict: ReviewVerdict | null = null;
+    let messages = packed.messages;
+    let lastOutput = "";
+    for (let attempt = 1; attempt <= REVIEW_MAX_ATTEMPTS && !verdict; attempt += 1) {
+      const response = await this.callModel(runId, {
+        topologyId: topology.id,
+        model,
+        agent: context.agent,
+        messages,
+        prefix,
+        purpose: "review",
+        order,
+        packed,
+        tailTokens: 0,
+        jsonSchema: reviewSchema(),
+        signal,
+      });
+      lastOutput = response.content;
+      verdict = parseVerdict(response.content);
+      if (!verdict) {
+        messages = [
+          ...packed.messages,
+          { role: "assistant", content: truncateToTokens(response.content, 200).text },
+          {
+            role: "user",
+            content:
+              'That reply was not a valid verdict. Reply with only a JSON object: {"verdict": "approve" | "revise" | "reject", "summary": string, "findings": [{"severity", "issue", "recommendation"}]}.',
+          },
+        ];
+      }
+    }
+
+    if (!verdict) {
+      const reason = `The reviewer did not return a valid verdict after ${REVIEW_MAX_ATTEMPTS} attempts. Last output: ${truncateToTokens(lastOutput.trim() || "(empty)", 80).text}`;
+      await this.store.mutateRun(runId, (draft) => {
+        const review = draft.workOrders.find((candidate) => candidate.id === orderId);
+        if (!review) return;
+        review.status = "failed";
+        review.phase = "done";
+        review.error = reason;
+        review.completedAt = now();
+        review.verdict = { verdict: "indeterminate", summary: reason, findings: [] };
+        review.summary = "indeterminate: review could not be completed";
+        draft.events.push(
+          event("review_indeterminate", `${agentName(topology, order.assigneeAgentId)} could not produce a valid verdict; the review is indeterminate.`, {
+            workOrderId: orderId,
+          }),
+        );
+        this.deliverReports(draft, topology, review);
+      });
+      return;
+    }
+    const final = verdict;
     await this.store.mutateRun(runId, (draft) => {
       draft.events.push(
-        event("review_verdict", `${agentName(topology, order.assigneeAgentId)} returned ${verdict.verdict} with ${verdict.findings.length} findings.`, {
+        event("review_verdict", `${agentName(topology, order.assigneeAgentId)} returned ${final.verdict} with ${final.findings.length} findings.`, {
           workOrderId: order.id,
-          verdict: verdict.verdict,
+          verdict: final.verdict,
         }),
       );
     });
-    await this.completeOrder(runId, orderId, topology, formatVerdict(verdict), verdict);
+    await this.completeOrder(runId, orderId, topology, formatVerdict(final), { verdict: final });
   }
 
   // ------------------------------------------------------ handoff/consult
@@ -1264,6 +1562,8 @@ export class RuntimeEngine {
         summary: null,
         verdict: null,
         draft: null,
+        reviewOutcome: null,
+        checkpoint: null,
         createdAt: now(),
         startedAt: null,
         completedAt: null,
@@ -1275,14 +1575,28 @@ export class RuntimeEngine {
       };
       source.status = "handed_off";
       source.phase = "done";
+      source.checkpoint = null;
       source.handedOffToOrderId = successor.id;
       source.completedAt = now();
       source.result = `Handed off to ${agentName(topology, request.agentId)}: ${request.reason}`;
       source.summary = source.result;
       if (draft.rootOrderId === source.id) draft.rootOrderId = successor.id;
+      // Anything waiting on, or reviewing, the source now waits on and reviews
+      // the successor's actual work (audit B2), in the same transaction.
+      let retargeted = 0;
+      for (const other of draft.workOrders) {
+        if (other.id === source.id || terminalWorkOrderStatuses.includes(other.status)) continue;
+        const dependencies = other.dependencies.map((id) => (id === source.id ? successor.id : id));
+        const subjects = other.subjectOrderIds.map((id) => (id === source.id ? successor.id : id));
+        if (dependencies.join() !== other.dependencies.join() || subjects.join() !== other.subjectOrderIds.join()) {
+          other.dependencies = dependencies;
+          other.subjectOrderIds = subjects;
+          retargeted += 1;
+        }
+      }
       draft.workOrders.push(successor);
       draft.events.push(
-        event("handoff", `${agentName(topology, source.assigneeAgentId)} handed off responsibility to ${agentName(topology, request.agentId)}.`, {
+        event("handoff", `${agentName(topology, source.assigneeAgentId)} handed off responsibility to ${agentName(topology, request.agentId)}${retargeted ? `; ${retargeted} dependent order${retargeted === 1 ? "" : "s"} now track the successor` : ""}.`, {
           fromOrderId: source.id,
           toOrderId: successor.id,
         }),
@@ -1292,40 +1606,52 @@ export class RuntimeEngine {
     return true;
   }
 
-  /** Synchronous consultation from inside a tool loop; the requester keeps ownership. */
-  private async consultInline(state: LoopState, agentId: string, question: string): Promise<string> {
+  /**
+   * Synchronous consultation from inside a tool loop; the requester keeps
+   * ownership. The child is owned by the tool call's operation ID, so a
+   * resumed call reuses the same consultation instead of creating another.
+   */
+  private async consultInline(state: LoopState, record: ToolCallRecord, agentId: string, question: string): Promise<string> {
     const topology = this.store.getTopology(state.topologyId);
     if (!topology || !hasCollaborationPermission(topology, state.order.assigneeAgentId, agentId, "agent_can_consult_agent")) {
       return `ERROR: ${agentId} is not a connected consultant for this agent.`;
     }
-    let childId = "";
-    await this.store.mutateRun(state.runId, (draft) => {
-      const parent = draft.workOrders.find((candidate) => candidate.id === state.order.id);
-      if (!parent) return;
-      const child = this.newChild(parent, {
-        assigneeAgentId: agentId,
-        objective: question,
-        returnRelationship: "consult",
-        expectedOutput: "Advice for the requesting agent.",
-        requiredInputs: [this.parentContextInput(parent)],
-        phase: "execute",
-        blocking: false,
-        status: "running",
-        startedAt: now(),
-        priority: 90,
+    let childId = record.childOrderId ?? "";
+    const existing = childId ? this.store.getRun(state.runId)?.workOrders.find((candidate) => candidate.id === childId) : undefined;
+    if (existing && isTerminal(existing)) {
+      return existing.status === "completed" ? existing.result ?? "No advice." : `Consultation unavailable: ${existing.error ?? "unknown error"}`;
+    }
+    if (!existing) {
+      await this.store.mutateRun(state.runId, (draft) => {
+        const parent = draft.workOrders.find((candidate) => candidate.id === state.order.id);
+        if (!parent) return;
+        const child = this.newChild(parent, {
+          assigneeAgentId: agentId,
+          objective: question,
+          returnRelationship: "consult",
+          expectedOutput: "Advice for the requesting agent.",
+          requiredInputs: [this.parentContextInput(parent)],
+          phase: "execute",
+          blocking: false,
+          status: "queued",
+          priority: 90,
+          ownerOperationId: record.id,
+        });
+        childId = child.id;
+        draft.workOrders.push(child);
+        const ledger = draft.toolCalls.find((call) => call.id === record.id);
+        if (ledger) ledger.childOrderId = child.id;
+        draft.events.push(
+          event("work_order_created", `${agentName(topology, parent.assigneeAgentId)} consulted ${agentName(topology, agentId)}.`, {
+            workOrderId: child.id,
+            relationship: "consult",
+          }),
+        );
       });
-      childId = child.id;
-      draft.workOrders.push(child);
-      draft.events.push(
-        event("work_order_created", `${agentName(topology, parent.assigneeAgentId)} consulted ${agentName(topology, agentId)}.`, {
-          workOrderId: child.id,
-          relationship: "consult",
-        }),
-      );
-    });
+    }
     if (!childId) return "ERROR: consultation could not be created.";
-    await this.executeWorkOrder(state.runId, childId, state.signal, true);
-    if (state.signal.aborted) throw new DOMException("Run paused", "AbortError");
+    await this.executeWorkOrder(state.runId, childId, state.signal);
+    if (state.signal.aborted) throw abortError();
     const child = this.store.getRun(state.runId)?.workOrders.find((candidate) => candidate.id === childId);
     return child?.status === "completed"
       ? child.result ?? "No advice."
@@ -1334,15 +1660,20 @@ export class RuntimeEngine {
 
   // ------------------------------------------------------ context segments
 
-  private async historySegments(run: Run, order: WorkOrder): Promise<DynamicSegment[]> {
-    if (order.returnRelationship !== "root" && order.returnRelationship !== "handoff") return [];
-    if (!run.previousRunId) return [];
+  /** Prior runs listed in this run's thread digest (at most three). */
+  private threadRuns(run: Run): Run[] {
     const runs: Run[] = [];
-    let cursor = this.store.getRun(run.previousRunId);
+    let cursor = run.previousRunId ? this.store.getRun(run.previousRunId) : null;
     while (cursor && runs.length < 3) {
       runs.push(cursor);
       cursor = cursor.previousRunId ? this.store.getRun(cursor.previousRunId) : null;
     }
+    return runs;
+  }
+
+  private async historySegments(run: Run, order: WorkOrder): Promise<DynamicSegment[]> {
+    if (order.returnRelationship !== "root" && order.returnRelationship !== "handoff") return [];
+    const runs = this.threadRuns(run);
     if (runs.length === 0) return [];
     const lines = runs.reverse().map((previous) => {
       const root = this.currentRoot(previous);
@@ -1404,6 +1735,9 @@ export class RuntimeEngine {
     );
     const block = (child: WorkOrder, full: boolean) => {
       const heading = `### ${agentName(topology, child.assigneeAgentId)} · ${child.returnRelationship}${child.revisionOf ? " (revision)" : ""} · ${child.status} · id ${child.id}`;
+      if (child.returnRelationship === "review" && reviewOutcomeOf(child) === "indeterminate") {
+        return `${heading}\nREVIEW COULD NOT BE COMPLETED: ${child.error ?? child.verdict?.summary ?? "no verdict"}. Treat the reviewed work as unreviewed.`;
+      }
       const body = full
         ? (child.result ?? child.error ?? "No result")
         : `${child.summary ?? (child.error ? `Failed: ${child.error}` : "No result")}\n(full result: read_artifact ${child.id})`;
@@ -1444,7 +1778,7 @@ export class RuntimeEngine {
           (candidate) =>
             candidate.returnRelationship === "review" &&
             candidate.subjectOrderIds.includes(revisionSubject.id) &&
-            candidate.verdict,
+            candidate.verdict?.verdict === "revise",
         );
       if (review?.verdict) {
         const previous = revisionSubject.id === order.id ? order.draft : revisionSubject.result;
@@ -1464,13 +1798,28 @@ export class RuntimeEngine {
 
   // ----------------------------------------------------------- tool loop
 
+  private currentOrder(state: LoopState): WorkOrder {
+    return this.store.getRun(state.runId)?.workOrders.find((candidate) => candidate.id === state.order.id) ?? state.order;
+  }
+
+  /**
+   * The tool loop is checkpointed durably (audit A3/B4/B1):
+   * - every assistant tool-call turn and every tool result is persisted in
+   *   the order's checkpoint, and each call has a ledger row written before
+   *   and after its effect;
+   * - resuming continues from the checkpoint and classifies calls that were
+   *   in flight (safe → retried with the same operation ID; effectful →
+   *   reconciliation), instead of re-running the loop from scratch;
+   * - the context is refitted before every model call, not only the first.
+   */
   private async runAgentLoop(
     state: LoopState,
     dynamic: DynamicSegment[],
-    purpose: ContextFrame["purpose"],
+    purpose: ExecutionCheckpoint["purpose"],
   ): Promise<LoopOutcome> {
     const { model, prefix, context } = state;
     const packed = packContext(prefix, dynamic, model, context.agent);
+    state.packed = packed;
     if (packed.trimmedLabels.length) {
       await this.store.mutateRun(state.runId, (draft) => {
         draft.events.push(
@@ -1480,49 +1829,85 @@ export class RuntimeEngine {
         );
       });
     }
-    const messages: ChatMessage[] = [...packed.messages];
-    const initialCount = messages.length;
-    const maxIterations = context.agent.config.maxToolIterations;
 
-    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    const stored = this.currentOrder(state).checkpoint;
+    const checkpoint: ExecutionCheckpoint =
+      stored && stored.purpose === purpose ? stored : { purpose, messages: [], loaded: [] };
+    if (stored !== checkpoint) {
+      await this.store.mutateRun(state.runId, (draft) => {
+        const current = draft.workOrders.find((candidate) => candidate.id === state.order.id);
+        if (current) current.checkpoint = checkpoint;
+      });
+    } else if (checkpoint.messages.length > 0) {
+      await this.store.mutateRun(state.runId, (draft) => {
+        draft.events.push(
+          event("run_resumed", `${context.agent.name} resumed its tool loop from a checkpoint (${checkpoint.messages.filter((message) => message.role === "tool").length} recorded tool results are not repeated).`, {
+            workOrderId: state.order.id,
+          }),
+        );
+      });
+    }
+    state.loaded = new Set(checkpoint.loaded);
+    const tail: ChatMessage[] = checkpoint.messages.map((message) => ({ ...message }));
+
+    const pending = await this.completePendingCalls(state, tail);
+    if (pending) return pending;
+
+    const maxIterations = context.agent.config.maxToolIterations;
+    let iterations = tail.filter((message) => message.role === "assistant").length;
+    while (iterations < maxIterations) {
+      const fitted = fitToolTail(packed, tail);
       const response = await this.callModel(state.runId, {
+        topologyId: state.topologyId,
         model,
         agent: context.agent,
-        messages,
+        messages: [...packed.messages, ...fitted.messages],
         prefix,
-        purpose: iteration === 0 ? purpose : "tool_followup",
+        purpose: iterations === 0 ? purpose : "tool_followup",
         order: state.order,
         packed,
-        tailTokens: toolTailTokens(messages, initialCount),
+        tailTokens: fitted.tailTokens,
+        elided: fitted.elided,
         tools: prefix.tools,
         signal: state.signal,
       });
+      iterations += 1;
       if (response.toolCalls.length === 0) {
         if (!response.content.trim()) throw new Error("Model returned an empty response.");
         return { kind: "result", text: response.content.trim() };
       }
-      messages.push({ role: "assistant", content: response.content || null, toolCalls: response.toolCalls });
-      for (const call of response.toolCalls) {
-        const outcome = await this.handleToolCall(state, call);
-        if (outcome.handoff) return { kind: "handoff", ...outcome.handoff };
-        messages.push({ role: "tool", name: call.function.name, toolCallId: call.id, content: outcome.content });
-      }
+
+      // Persist the requesting turn and planned ledger rows before any effect.
+      const turnIndex = tail.length;
+      const assistant: ChatMessage = { role: "assistant", content: response.content || null, toolCalls: response.toolCalls };
+      tail.push(assistant);
+      const records = response.toolCalls.map((call, callIndex) => this.planRecord(state, call, turnIndex, callIndex));
+      await this.store.mutateRun(state.runId, (draft) => {
+        const current = draft.workOrders.find((candidate) => candidate.id === state.order.id);
+        if (current?.checkpoint) current.checkpoint.messages.push(assistant);
+        draft.toolCalls.push(...records);
+      });
+      const outcome = await this.runCalls(state, tail, records.map((record, index) => ({ record, call: response.toolCalls[index]! })));
+      if (outcome) return outcome;
     }
 
     // Tool budget exhausted: ask once more for a final answer without tools.
-    messages.push({
+    const closing: ChatMessage = {
       role: "user",
       content: "Tool-call budget exhausted. Provide your final answer now without calling tools.",
-    });
+    };
+    const fitted = fitToolTail(packed, [...tail, closing]);
     const final = await this.callModel(state.runId, {
+      topologyId: state.topologyId,
       model,
       agent: context.agent,
-      messages,
+      messages: [...packed.messages, ...fitted.messages],
       prefix,
       purpose: "tool_followup",
       order: state.order,
       packed,
-      tailTokens: toolTailTokens(messages, initialCount),
+      tailTokens: fitted.tailTokens,
+      elided: fitted.elided,
       tools: [],
       signal: state.signal,
     });
@@ -1530,51 +1915,234 @@ export class RuntimeEngine {
     return { kind: "result", text: final.content.trim() };
   }
 
-  private async recordTool(
+  /** Effect class and target of a requested call, decided before it runs. */
+  private classify(state: LoopState, call: ToolCall): Pick<ToolCallRecord, "targetName" | "sourceKind" | "effect"> {
+    const name = call.function.name;
+    const args = parseArgs(call.function.arguments);
+    const fromDescriptor = (descriptor: ToolDescriptor | undefined): Pick<ToolCallRecord, "targetName" | "sourceKind" | "effect"> => {
+      if (!descriptor) return { targetName: name, sourceKind: "meta", effect: "none" };
+      let effect: EffectClass = descriptor.effect;
+      if (descriptor.source.kind === "http") {
+        const topology = this.store.getTopology(state.topologyId);
+        const connector = topology?.nodes.find((node) => node.id === descriptor.source.nodeId);
+        const method = String(args.method ?? "GET");
+        if (connector?.kind === "connector") effect = httpEffect(method, connector);
+      }
+      return { targetName: descriptor.name, sourceKind: descriptor.source.kind, effect };
+    };
+    if (name === "call_tool") {
+      const target = String(args.name ?? "");
+      const descriptor = state.prefix.exposure.deferred.find((candidate) => candidate.name === target);
+      if (!descriptor) return { targetName: target || name, sourceKind: "meta", effect: "none" };
+      const inner = parseArgs(JSON.stringify(args.arguments ?? {}));
+      if (descriptor.source.kind === "http") {
+        const topology = this.store.getTopology(state.topologyId);
+        const connector = topology?.nodes.find((node) => node.id === descriptor.source.nodeId);
+        if (connector?.kind === "connector") {
+          return { targetName: descriptor.name, sourceKind: "http", effect: httpEffect(String(inner.method ?? "GET"), connector) };
+        }
+      }
+      return { targetName: descriptor.name, sourceKind: descriptor.source.kind, effect: descriptor.effect };
+    }
+    if (isMetaTool(name)) return { targetName: name, sourceKind: "meta", effect: "none" };
+    return fromDescriptor(state.prefix.exposure.native.find((candidate) => candidate.name === name));
+  }
+
+  private planRecord(state: LoopState, call: ToolCall, turnIndex: number, callIndex: number): ToolCallRecord {
+    const classified = this.classify(state, call);
+    const id = randomUUID();
+    return {
+      id,
+      workOrderId: state.order.id,
+      agentId: state.context.agent.id,
+      toolName: call.function.name,
+      ...classified,
+      status: "planned",
+      turnIndex,
+      callIndex,
+      providerCallId: call.id,
+      argumentsPreview: call.function.arguments.slice(0, 4_000),
+      idempotencyKey: classified.effect === "none" ? null : id,
+      attempts: 0,
+      result: null,
+      error: null,
+      childOrderId: null,
+      note: null,
+      createdAt: now(),
+      startedAt: null,
+      completedAt: null,
+    };
+  }
+
+  /**
+   * Finish the calls of the last persisted assistant turn that have no
+   * recorded result (the process stopped or the run paused mid-turn).
+   */
+  private async completePendingCalls(state: LoopState, tail: ChatMessage[]): Promise<LoopOutcome | null> {
+    const turnIndex = tail.map((message) => message.role).lastIndexOf("assistant");
+    const turn = tail[turnIndex];
+    if (!turn?.toolCalls?.length) return null;
+    const answered = tail.slice(turnIndex + 1).filter((message) => message.role === "tool").length;
+    if (answered >= turn.toolCalls.length) return null;
+    const run = this.store.getRun(state.runId);
+    const records = (run?.toolCalls ?? []).filter(
+      (record) => record.workOrderId === state.order.id && record.turnIndex === turnIndex,
+    );
+    const pending = turn.toolCalls.slice(answered).map((call, offset) => {
+      const callIndex = answered + offset;
+      return { call, record: records.find((record) => record.callIndex === callIndex) ?? this.planRecord(state, call, turnIndex, callIndex) };
+    });
+    const missing = pending.filter(({ record }) => !records.includes(record)).map(({ record }) => record);
+    if (missing.length) {
+      await this.store.mutateRun(state.runId, (draft) => {
+        draft.toolCalls.push(...missing);
+      });
+    }
+    return this.runCalls(state, tail, pending);
+  }
+
+  /** Execute calls in order; every effect is bracketed by durable ledger writes. */
+  private async runCalls(
     state: LoopState,
-    name: string,
-    content: string,
-    extra: { boundary?: string; artifact?: ArtifactRecord; eventType?: RuntimeEvent["type"]; message?: string } = {},
-  ): Promise<void> {
+    tail: ChatMessage[],
+    calls: Array<{ call: ToolCall; record: ToolCallRecord }>,
+  ): Promise<LoopOutcome | null> {
+    for (const { call, record } of calls) {
+      const latest = this.store.getRun(state.runId)?.toolCalls.find((candidate) => candidate.id === record.id) ?? record;
+      let outcome: CallOutcome;
+      switch (latest.status) {
+        case "succeeded":
+        case "failed":
+          outcome = { content: latest.result ?? latest.error ?? "", isError: latest.status === "failed" };
+          break;
+        case "reconciled_applied":
+          outcome = {
+            content: `The operator confirmed this call took effect.${latest.note ? ` Notes: ${latest.note}` : ""}`,
+            isError: false,
+          };
+          break;
+        case "reconciled_not_applied":
+          outcome = {
+            content: `ERROR: This call did not take effect and was not retried automatically.${latest.note ? ` Notes: ${latest.note}` : ""} Call the tool again only if it is still needed.`,
+            isError: true,
+          };
+          break;
+        case "indeterminate":
+          throw await this.requireReconciliation(state, latest);
+        case "started":
+          // Interrupted mid-effect. Only calls that are safe to repeat run again.
+          if (latest.effect === "effectful") throw await this.requireReconciliation(state, latest);
+          outcome = await this.executeRecorded(state, call, latest);
+          break;
+        case "planned":
+          outcome = await this.executeRecorded(state, call, latest);
+          break;
+      }
+      const message: ChatMessage = {
+        role: "tool",
+        name: call.function.name,
+        toolCallId: call.id,
+        content: this.capToolResult(state, outcome.content, latest.id),
+        operationId: latest.id,
+      };
+      tail.push(message);
+      await this.store.mutateRun(state.runId, (draft) => {
+        const current = draft.workOrders.find((candidate) => candidate.id === state.order.id);
+        if (current?.checkpoint) {
+          current.checkpoint.messages.push(message);
+          current.checkpoint.loaded = [...state.loaded];
+        }
+      });
+      if (outcome.handoff) return { kind: "handoff", ...outcome.handoff };
+    }
+    return null;
+  }
+
+  /** Bound a single tool result relative to the space the loop has left. */
+  private capToolResult(state: LoopState, content: string, operationId: string): string {
+    const budget = state.packed ? toolTailBudget(state.packed) : 4_000;
+    const limit = Math.max(96, Math.floor(budget * 0.5));
+    const truncated = truncateToTokens(content, limit);
+    return truncated.trimmed ? `${truncated.text}\n[Full result: read_artifact("tool:${operationId}")]` : content;
+  }
+
+  private async requireReconciliation(state: LoopState, record: ToolCallRecord): Promise<ReconciliationRequired> {
+    const message = `${record.targetName} may or may not have taken effect (the run stopped while it was in flight) and repeating it could duplicate the effect. Reconcile it before resuming.`;
     await this.store.mutateRun(state.runId, (draft) => {
+      const ledger = draft.toolCalls.find((call) => call.id === record.id);
+      if (ledger && ledger.status !== "indeterminate") {
+        ledger.status = "indeterminate";
+        ledger.error = "Outcome unknown: interrupted during an effectful call.";
+        draft.events.push(event("tool_call_indeterminate", message, { operationId: record.id, workOrderId: record.workOrderId }));
+      }
+      const order = draft.workOrders.find((candidate) => candidate.id === state.order.id);
+      if (order && order.status === "running") order.status = "awaiting_reconciliation";
+      if (draft.status !== "completed" && draft.status !== "failed") {
+        draft.status = "paused";
+        draft.pauseReason = "A tool call's outcome is unknown and needs reconciliation.";
+        draft.events.push(event("reconciliation_required", message, { operationId: record.id }));
+      }
+    });
+    return new ReconciliationRequired(message);
+  }
+
+  /** started → effect → succeeded/failed, each state persisted around the effect. */
+  private async executeRecorded(state: LoopState, call: ToolCall, record: ToolCallRecord): Promise<CallOutcome> {
+    // Commit point: once paused, no new effect is dispatched (audit B4).
+    if (state.signal.aborted) throw abortError();
+    await this.store.mutateRun(state.runId, (draft) => {
+      const ledger = draft.toolCalls.find((candidate) => candidate.id === record.id);
+      if (!ledger) return;
+      ledger.status = "started";
+      ledger.attempts += 1;
+      ledger.startedAt = now();
+    });
+    if (state.signal.aborted) throw abortError();
+    const outcome = await this.dispatchTool(state, call, record);
+    await this.store.mutateRun(state.runId, (draft) => {
+      const ledger = draft.toolCalls.find((candidate) => candidate.id === record.id);
+      if (ledger) {
+        ledger.status = outcome.isError ? "failed" : "succeeded";
+        ledger.result = outcome.isError ? null : truncateResult(outcome.content, TOOL_RESULT_CHARS);
+        ledger.error = outcome.isError ? outcome.content.slice(0, 4_000) : null;
+        ledger.completedAt = now();
+      }
       draft.metrics.toolCalls += 1;
       draft.messages.push({
         id: randomUUID(),
         role: "tool",
         agentId: state.context.agent.id,
-        content: `${name}: ${truncateResult(content, 2_000)}`,
+        content: `${record.targetName}: ${truncateResult(outcome.content, 2_000)}`,
         createdAt: now(),
         workOrderId: state.order.id,
       });
-      draft.events.push(
-        event(extra.eventType ?? "tool_called", extra.message ?? `${state.context.agent.name} used ${name}.`, {
-          agentId: state.context.agent.id,
-          workOrderId: state.order.id,
-          tool: name,
-        }),
-      );
-      if (extra.boundary) {
-        draft.events.push(event("topology_boundary", extra.boundary, { agentId: state.context.agent.id, tool: name }));
+      if (outcome.artifact) {
+        draft.artifacts.push(outcome.artifact);
+        draft.events.push(event("artifact_written", `${state.context.agent.name} wrote ${outcome.artifact.name}.`, { artifactId: outcome.artifact.id }));
       }
-      if (extra.artifact) {
-        draft.artifacts.push(extra.artifact);
-        draft.events.push(event("artifact_written", `${state.context.agent.name} wrote ${extra.artifact.name}.`, { artifactId: extra.artifact.id }));
-      }
+    });
+    return outcome;
+  }
+
+  private async boundaryEvent(state: LoopState, message: string, tool: string): Promise<void> {
+    await this.store.mutateRun(state.runId, (draft) => {
+      draft.events.push(event("topology_boundary", message, { agentId: state.context.agent.id, tool, workOrderId: state.order.id }));
     });
   }
 
-  private async handleToolCall(
-    state: LoopState,
-    call: ToolCall,
-  ): Promise<{ content: string; handoff?: HandoffRequest }> {
+  private async dispatchTool(state: LoopState, call: ToolCall, record: ToolCallRecord): Promise<CallOutcome> {
     const name = call.function.name;
     const args = parseArgs(call.function.arguments);
     const exposedNames = new Set(state.prefix.tools.map((tool) => tool.function.name));
+    const note = async (type: RuntimeEvent["type"], message: string) =>
+      this.store.mutateRun(state.runId, (draft) => {
+        draft.events.push(event(type, message, { agentId: state.context.agent.id, workOrderId: state.order.id, tool: name }));
+      });
 
     if (!exposedNames.has(name)) {
       const message = `Topology boundary denied '${name}' for agent '${state.context.agent.name}': it is not connected.`;
-      await this.recordTool(state, name, message, { boundary: message });
-      return { content: `ERROR: ${message}` };
+      await this.boundaryEvent(state, message, name);
+      return { content: `ERROR: ${message}`, isError: true };
     }
 
     if (isMetaTool(name)) {
@@ -1583,22 +2151,21 @@ export class RuntimeEngine {
           const names = Array.isArray(args.names) ? args.names.map(String) : [];
           const matches = searchDescriptors(state.prefix.exposure.deferred, String(args.query ?? ""), names);
           for (const match of matches) state.loaded.add(match.name);
-          const content = matches.length
-            ? JSON.stringify({ tools: matches.map((match) => toolDefinition(match).function) })
-            : JSON.stringify({ tools: [], note: "No authorized tool matched. Check the catalog names." });
-          await this.recordTool(state, name, `loaded ${matches.map((match) => match.name).join(", ") || "nothing"}`, {
-            eventType: "capability_loaded",
-            message: `${state.context.agent.name} loaded ${matches.length} tool schema${matches.length === 1 ? "" : "s"} on demand.`,
-          });
-          return { content };
+          await note("capability_loaded", `${state.context.agent.name} loaded ${matches.length} tool schema${matches.length === 1 ? "" : "s"} on demand.`);
+          return {
+            content: matches.length
+              ? JSON.stringify({ tools: matches.map((match) => toolDefinition(match).function) })
+              : JSON.stringify({ tools: [], note: "No authorized tool matched. Check the catalog names." }),
+            isError: false,
+          };
         }
         case "call_tool": {
           const target = String(args.name ?? "");
           const descriptor = state.prefix.exposure.deferred.find((candidate) => candidate.name === target);
           if (!descriptor) {
             const message = `Topology boundary denied '${target}' for agent '${state.context.agent.name}'.`;
-            await this.recordTool(state, target || name, message, { boundary: message });
-            return { content: `ERROR: ${message}` };
+            await this.boundaryEvent(state, message, target || name);
+            return { content: `ERROR: ${message}`, isError: true };
           }
           if (!state.loaded.has(target)) {
             // Require the schema to be seen first; return it instead of guessing.
@@ -1608,33 +2175,33 @@ export class RuntimeEngine {
                 error: "Load the schema before calling. Retry call_tool with arguments matching this schema.",
                 tool: toolDefinition(descriptor).function,
               }),
+              isError: true,
             };
           }
-          return { content: await this.invokeDescriptor(state, descriptor, args.arguments ?? {}) };
+          return this.invokeDescriptor(state, descriptor, args.arguments ?? {}, record);
         }
         case "load_skill": {
           const skill = state.prefix.onDemandSkills.find((candidate) => candidate.name === args.name);
-          if (!skill) return { content: "ERROR: Unknown skill." };
-          await this.recordTool(state, name, skill.name, {
-            eventType: "capability_loaded",
-            message: `${state.context.agent.name} loaded skill ${skill.name}.`,
-          });
-          return { content: `SKILL: ${skill.name}\n${skill.config.instructions}` };
+          if (!skill) return { content: "ERROR: Unknown skill.", isError: true };
+          await note("capability_loaded", `${state.context.agent.name} loaded skill ${skill.name}.`);
+          return { content: `SKILL: ${skill.name}\n${skill.config.instructions}`, isError: false };
         }
-        case "consult_agent": {
-          const advice = await this.consultInline(state, String(args.agentId ?? ""), String(args.question ?? ""));
-          return { content: advice };
-        }
+        case "consult_agent":
+          return {
+            content: await this.consultInline(state, record, String(args.agentId ?? ""), String(args.question ?? "")),
+            isError: false,
+          };
         case "handoff_work": {
           // A refused handoff is a recoverable tool error, not an order failure.
           const denial = this.handoffDenial(state.runId, state.order.id, String(args.agentId ?? ""));
           if (denial) {
             const message = `Handoff refused: ${denial}`;
-            await this.recordTool(state, name, message, { boundary: message });
-            return { content: `ERROR: ${message} Continue the work yourself.` };
+            await this.boundaryEvent(state, message, name);
+            return { content: `ERROR: ${message} Continue the work yourself.`, isError: true };
           }
           return {
             content: "Handoff requested.",
+            isError: false,
             handoff: {
               agentId: String(args.agentId ?? ""),
               reason: String(args.reason ?? "Better suited agent."),
@@ -1644,28 +2211,40 @@ export class RuntimeEngine {
           };
         }
         case "read_artifact":
-          return { content: this.readArtifact(state.runId, String(args.id ?? "")) };
+          return this.readArtifact(state, String(args.id ?? ""));
       }
     }
 
     const descriptor = state.prefix.exposure.native.find((candidate) => candidate.name === name);
-    if (!descriptor) return { content: `ERROR: Tool '${name}' is unavailable.` };
-    return { content: await this.invokeDescriptor(state, descriptor, args) };
+    if (!descriptor) return { content: `ERROR: Tool '${name}' is unavailable.`, isError: true };
+    return this.invokeDescriptor(state, descriptor, args, record);
   }
 
   /** Re-check authorization against the current topology, then execute. */
-  private async invokeDescriptor(state: LoopState, descriptor: ToolDescriptor, args: unknown): Promise<string> {
+  private async invokeDescriptor(
+    state: LoopState,
+    descriptor: ToolDescriptor,
+    args: unknown,
+    record: ToolCallRecord,
+  ): Promise<CallOutcome> {
     const topology = this.store.getTopology(state.topologyId);
     const context = topology ? getAgentContext(topology, state.context.agent.id) : null;
+    if (context && descriptor.source.kind === "mcp") {
+      const connector = context.connectors.find((candidate) => candidate.id === descriptor.source.nodeId);
+      if (connector && !this.mcp.isVerified(connector)) await this.refreshCatalog(state.runId, connector);
+    }
     const current = context
-      ? resolveToolDescriptors(context, this.store.listCatalogs(), state.accessMode).find(
-          (candidate) => candidate.name === descriptor.name && sameSource(candidate.source, descriptor.source),
+      ? resolveToolDescriptors(context, this.exposableCatalogs(context), state.accessMode).find(
+          (candidate) =>
+            candidate.name === descriptor.name &&
+            sameSource(candidate.source, descriptor.source) &&
+            candidate.schemaHash === descriptor.schemaHash,
         )
       : undefined;
     if (!topology || !current) {
-      const message = `Topology boundary denied '${descriptor.name}' for agent '${state.context.agent.name}': the grant was removed.`;
-      await this.recordTool(state, descriptor.name, message, { boundary: message });
-      return `ERROR: ${message}`;
+      const message = `Topology boundary denied '${descriptor.name}' for agent '${state.context.agent.name}': the grant was removed or the tool definition changed.`;
+      await this.boundaryEvent(state, message, descriptor.name);
+      return { content: `ERROR: ${message}`, isError: true };
     }
     try {
       const outcome = await this.executor.execute(current, args, {
@@ -1674,6 +2253,7 @@ export class RuntimeEngine {
         agentId: state.context.agent.id,
         topology,
         signal: state.signal,
+        operationId: record.id,
       });
       const artifact: ArtifactRecord | undefined = outcome.written
         ? {
@@ -1690,33 +2270,33 @@ export class RuntimeEngine {
             createdAt: now(),
           }
         : undefined;
-      await this.recordTool(state, descriptor.name, outcome.content, { artifact });
       const content = truncateResult(outcome.content, TOOL_RESULT_CHARS);
-      return outcome.isError ? `ERROR: ${content}` : content;
+      return { content: outcome.isError ? `ERROR: ${content}` : content, isError: outcome.isError, artifact };
     } catch (error) {
       if (isAbort(error)) throw error;
       const message = error instanceof Error ? error.message : String(error);
-      const boundary = /boundary|scope|not granted/i.test(message) ? message : undefined;
-      await this.recordTool(state, descriptor.name, `ERROR: ${message}`, { boundary });
-      return `ERROR: ${message}`;
+      if (/boundary|scope|not granted|link|junction|changed|verified|not allowed|drive|UNC/i.test(message)) {
+        await this.boundaryEvent(state, message, descriptor.name);
+      }
+      return { content: `ERROR: ${message}`, isError: true };
     }
   }
 
-  private readArtifact(runId: string, id: string): string {
-    const run = this.store.getRun(runId);
-    if (!run) return "ERROR: run unavailable.";
-    const threadRuns = run.threadId
-      ? this.store.listThread(run.threadId)
-      : [run];
-    for (const candidate of [run, ...threadRuns]) {
-      const order = candidate.workOrders.find((item) => item.id === id);
-      if (order) {
-        const content = order.result ?? order.draft ?? order.error ?? "No content yet.";
-        return truncateResult(content, ARTIFACT_READ_CHARS);
-      }
-      if (candidate.id === id && candidate.result) return truncateResult(candidate.result, ARTIFACT_READ_CHARS);
+  /** read_artifact through the information-flow policy (audit A2). */
+  private async readArtifact(state: LoopState, id: string): Promise<CallOutcome> {
+    const run = this.store.getRun(state.runId);
+    if (!run) return { content: "ERROR: run unavailable.", isError: true };
+    const order = run.workOrders.find((candidate) => candidate.id === state.order.id) ?? state.order;
+    const threadRoots = this.threadRuns(run).flatMap((previous) => {
+      const root = this.currentRoot(previous);
+      return root ? [{ runId: previous.id, order: root }] : [];
+    });
+    const decision = resolveArtifact(run, order, id, threadRoots);
+    if (!decision.allowed) {
+      await this.boundaryEvent(state, `Artifact access denied for ${state.context.agent.name}: ${decision.reason}`, "read_artifact");
+      return { content: `ERROR: ${decision.reason}`, isError: true };
     }
-    return `ERROR: No artifact '${id}' is visible from this work order.`;
+    return { content: truncateResult(decision.content, TOOL_RESULT_CHARS), isError: false };
   }
 
   // ---------------------------------------------------------- model calls
@@ -1724,6 +2304,7 @@ export class RuntimeEngine {
   private async callModel(
     runId: string,
     input: {
+      topologyId: string;
       model: ModelNode;
       agent: AgentNode;
       messages: ChatMessage[];
@@ -1732,6 +2313,7 @@ export class RuntimeEngine {
       order: WorkOrder;
       packed: ReturnType<typeof packContext>;
       tailTokens: number;
+      elided?: number;
       tools?: ToolDefinition[];
       jsonSchema?: Record<string, unknown>;
       signal: AbortSignal;
@@ -1747,14 +2329,16 @@ export class RuntimeEngine {
       packed: input.packed,
       prefix: input.prefix,
       tailTokens: input.tailTokens,
-      prefixReused: false,
       sendTools,
+      responseSchemaTokens: input.jsonSchema ? estimateJsonTokens(input.jsonSchema) : 0,
+      elidedToolResults: input.elided ?? 0,
     });
+    const key = modelPoolKey(input.topologyId, input.model.id);
     return this.modelPool.withModel(
       input.model,
       runId,
       async () => {
-        const result = await complete({
+        const request = {
           model: input.model,
           messages: input.messages,
           tools: sendTools ? input.tools : undefined,
@@ -1762,27 +2346,37 @@ export class RuntimeEngine {
           maxTokens: input.agent.config.maxOutputTokens,
           jsonSchema: input.jsonSchema,
           signal: input.signal,
-        });
-        const key = `${frame.prefixHash}:${frame.toolsHash}`;
-        frame.prefixReused = this.lastPrefixByModel.get(input.model.id) === key;
-        this.lastPrefixByModel.set(input.model.id, key);
+        };
+        // Local prefix equality is decided at dispatch, in dispatch order.
+        frame.requestPrefixHash = requestPrefixHash(request);
+        frame.localPrefixMatch = this.lastDispatchedPrefix.get(key) === frame.requestPrefixHash;
+        this.lastDispatchedPrefix.set(key, frame.requestPrefixHash);
+        const result = await complete(request);
         frame.actualPromptTokens = result.usage.estimated ? null : result.usage.promptTokens;
         frame.cachedPromptTokens = result.usage.cachedPromptTokens ?? null;
         await this.recordUsage(runId, result, frame);
         return result;
       },
       input.signal,
+      key,
     );
   }
 
   private async recordUsage(runId: string, response: CompletionResult, frame: ContextFrame): Promise<void> {
     await this.store.mutateRun(runId, (run) => {
       run.metrics.modelCalls += 1;
-      run.metrics.promptTokens += response.usage.promptTokens;
-      run.metrics.completionTokens += response.usage.completionTokens;
-      run.metrics.cachedPromptTokens += response.usage.cachedPromptTokens ?? 0;
+      // Only server-reported usage counts as measured tokens.
+      if (!response.usage.estimated) {
+        run.metrics.usageReportedCalls += 1;
+        run.metrics.promptTokens += response.usage.promptTokens;
+        run.metrics.completionTokens += response.usage.completionTokens;
+      }
+      if (typeof response.usage.cachedPromptTokens === "number") {
+        run.metrics.cacheReportedCalls += 1;
+        run.metrics.cachedPromptTokens += response.usage.cachedPromptTokens;
+      }
       run.metrics.estimatedPromptTokens += frame.estimatedPromptTokens;
-      if (frame.prefixReused) run.metrics.prefixReuses += 1;
+      if (frame.localPrefixMatch) run.metrics.localPrefixMatches += 1;
       run.metrics.elapsedMs = Date.now() - new Date(run.createdAt).getTime();
       run.contextFrames.push(frame);
       if (run.contextFrames.length > MAX_FRAMES_PER_RUN) {
@@ -1832,8 +2426,9 @@ export class RuntimeEngine {
     orderId: string,
     topology: Topology,
     result: string,
-    verdict: ReviewVerdict | null = null,
+    extra: { verdict?: ReviewVerdict | null; reviewOutcome?: WorkOrder["reviewOutcome"] } = {},
   ): Promise<void> {
+    const verdict = extra.verdict ?? null;
     await this.store.mutateRun(runId, (draft) => {
       const completed = draft.workOrders.find((candidate) => candidate.id === orderId);
       if (!completed) return;
@@ -1843,9 +2438,18 @@ export class RuntimeEngine {
       completed.error = null;
       completed.completedAt = now();
       completed.verdict = verdict;
+      completed.checkpoint = null;
+      if (extra.reviewOutcome !== undefined) completed.reviewOutcome = extra.reviewOutcome;
       completed.summary = verdict
         ? `${verdict.verdict}: ${summarize(verdict.summary || result, 80)}${verdict.findings.length ? ` (${verdict.findings.length} findings)` : ""}`
         : summarize(result);
+      // Inline consultations left unfinished by this order are abandoned, not orphaned.
+      for (const child of draft.workOrders) {
+        if (child.parentId === orderId && child.ownerOperationId && !terminalWorkOrderStatuses.includes(child.status)) {
+          child.status = "superseded";
+          child.error = "Abandoned: the requesting order finished without it.";
+        }
+      }
       draft.messages.push({
         id: randomUUID(),
         role: "agent",
@@ -1908,9 +2512,10 @@ export class RuntimeEngine {
             threadId: run.threadId,
             previousRunId: run.previousRunId,
             messages: run.messages,
-            workOrders: run.workOrders,
+            workOrders: run.workOrders.map((order) => ({ ...order, checkpoint: null })),
             plans: run.plans,
             reports: run.reports,
+            toolCalls: run.toolCalls,
             metrics: run.metrics,
           },
           null,
@@ -1944,6 +2549,7 @@ export class RuntimeEngine {
             `Objective: ${truncateToTokens(run.objective, 60).text}\nOutcome: ${summarize(result, 100)}`,
             ["run-summary"],
             { runId, workOrderId: run.rootOrderId, agentId: run.entryAgentId },
+            `run-summary-${runId}`,
           );
         } catch {
           // Memory is an optimization; a failed write never fails the run.

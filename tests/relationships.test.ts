@@ -205,10 +205,18 @@ describe("context lifecycle", () => {
     const builderFrames = run.contextFrames.filter((frame) => frame.agentId === "agent-builder");
     expect(builderFrames[0]?.purpose).toBe("execute");
     expect(builderFrames[1]?.purpose).toBe("tool_followup");
-    expect(builderFrames[1]?.prefixReused).toBe(true);
+    expect(builderFrames[1]?.localPrefixMatch).toBe(true);
+    expect(builderFrames[1]?.requestPrefixHash).toBe(builderFrames[0]?.requestPrefixHash);
     expect(builderFrames[1]?.segments.some((segment) => segment.kind === "tool_results")).toBe(true);
-    expect(run.metrics.prefixReuses).toBeGreaterThan(0);
-    expect(run.metrics.cachedPromptTokens).toBeGreaterThan(0);
+    expect(run.metrics.localPrefixMatches).toBeGreaterThan(0);
+    // The demo model has no tokenizer or cache: nothing is reported as measured (audit B5).
+    expect(run.metrics.usageReportedCalls).toBe(0);
+    expect(run.metrics.cacheReportedCalls).toBe(0);
+    expect(run.contextFrames.every((frame) => frame.actualPromptTokens === null && frame.cachedPromptTokens === null)).toBe(true);
+    // Plan calls carry a response schema, so their request prefix differs from tool calls.
+    const orchestratorFrames = run.contextFrames.filter((frame) => frame.agentId === "agent-orchestrator");
+    expect(orchestratorFrames[0]?.segments.some((segment) => segment.kind === "response_schema")).toBe(true);
+    expect(orchestratorFrames[0]?.requestPrefixHash).not.toBe(orchestratorFrames[1]?.requestPrefixHash);
     for (const frame of run.contextFrames) {
       expect(frame.estimatedPromptTokens).toBeLessThanOrEqual(frame.contextWindow);
     }
