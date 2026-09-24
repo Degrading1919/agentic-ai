@@ -1,8 +1,13 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import type { TopologyNode } from "../../shared/contracts.js";
+import type { AgentFootprint } from "../../shared/prompt.js";
+import { formatTokens } from "../../shared/tokens.js";
 import { nodeMeta } from "../node-meta.js";
 
-export type CanvasNodeData = { topologyNode: TopologyNode } & Record<string, unknown>;
+export type CanvasNodeData = {
+  topologyNode: TopologyNode;
+  footprint: AgentFootprint | null;
+} & Record<string, unknown>;
 export type CanvasNodeType = Node<CanvasNodeData, "capabilityNode">;
 
 function subtitle(node: TopologyNode): string {
@@ -10,16 +15,31 @@ function subtitle(node: TopologyNode): string {
     case "agent":
       return node.config.role;
     case "model":
-      return `${node.config.provider} · ${node.config.modelId}`;
+      return `${node.config.provider} · ${node.config.modelId}${node.config.artifact.quantization ? ` · ${node.config.artifact.quantization}` : ""}`;
     case "capability":
       return node.config.capabilityId;
     case "skill":
-      return "instruction bundle";
+      return node.config.loading === "on-demand" ? "on-demand skill" : "instruction bundle";
     case "connector":
-      return `${node.config.connectorType}${node.config.enabled ? "" : " · disabled"}`;
+      return `${node.config.connectorType}${node.config.connectorType === "mcp" ? ` · ${node.config.transport}` : ""}${node.config.enabled ? "" : " · disabled"}`;
     case "storage":
       return node.config.storageType;
   }
+}
+
+/** Static context cost of an agent relative to its model window. */
+function FootprintBadge({ footprint }: { footprint: AgentFootprint }) {
+  const share = footprint.contextWindow ? footprint.stableTokens / footprint.contextWindow : 0;
+  const tone = share > 0.5 ? "heavy" : share > 0.25 ? "warm" : "light";
+  return (
+    <span
+      className={`footprint-badge ${tone}`}
+      title={`Stable context ≈${footprint.stableTokens} tokens (${Math.round(share * 100)}% of the model window) before any work-order payload. Tools: ${footprint.exposedToolSchemas}/${footprint.authorizedTools} schemas sent (${footprint.exposure}).`}
+    >
+      {formatTokens(footprint.stableTokens)}
+      {footprint.exposure === "deferred" ? " · lazy" : ""}
+    </span>
+  );
 }
 
 export function CanvasNode({ data, selected }: NodeProps<CanvasNodeType>) {
@@ -38,7 +58,10 @@ export function CanvasNode({ data, selected }: NodeProps<CanvasNodeType>) {
         <strong>{node.name}</strong>
         <small>{subtitle(node)}</small>
       </div>
-      {node.kind === "agent" && node.config.entrypoint && <span className="node-chip">entry</span>}
+      <div className="node-chips">
+        {node.kind === "agent" && node.config.entrypoint && <span className="node-chip">entry</span>}
+        {data.footprint && <FootprintBadge footprint={data.footprint} />}
+      </div>
       <Handle type="source" position={Position.Right} className="node-handle source" />
     </div>
   );

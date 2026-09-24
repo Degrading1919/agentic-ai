@@ -9,6 +9,7 @@ import {
   topologySchema,
   type ConnectorNode,
   type ModelNode,
+  type Run,
 } from "../shared/contracts.js";
 import { estimateAgentFootprint } from "../shared/prompt.js";
 import { validateTopology } from "../shared/topology.js";
@@ -80,9 +81,25 @@ app.put<{ Params: { topologyId: string }; Body: unknown }>(
   },
 );
 
-app.get<{ Querystring: { limit?: string } }>("/api/runs", async (request) => {
+/** List view: drop heavy per-run detail; clients fetch one run in full when it changes. */
+function runSummary(run: Run): Run {
+  return {
+    ...run,
+    workOrders: [],
+    messages: [],
+    events: run.events.slice(-1),
+    contextFrames: [],
+    plans: [],
+    reports: [],
+    artifacts: [],
+    result: null,
+  };
+}
+
+app.get<{ Querystring: { limit?: string; view?: string } }>("/api/runs", async (request) => {
   const limit = Math.max(1, Math.min(200, Number(request.query.limit ?? 50) || 50));
-  return { runs: store.listRuns(limit) };
+  const runs = store.listRuns(limit);
+  return { runs: request.query.view === "summary" ? runs.map(runSummary) : runs };
 });
 
 app.get<{ Params: { runId: string } }>("/api/runs/:runId", async (request, reply) => {
@@ -187,6 +204,11 @@ if (existsSync(clientRoot)) {
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith("/api/")) {
       void reply.status(404).send({ error: "API route not found" });
+      return;
+    }
+    // A missing file (e.g. a stale asset hash) must 404, not fall back to the SPA shell.
+    if (/\.[a-z0-9]+(?:\?.*)?$/i.test(request.url)) {
+      void reply.status(404).send("Not found");
       return;
     }
     void reply.sendFile("index.html");

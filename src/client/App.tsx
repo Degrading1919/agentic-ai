@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Activity, Network, PanelsTopLeft, Sparkles } from "lucide-react";
-import type { Run, RuntimeSnapshot, Topology } from "../shared/contracts.js";
+import type { ConnectorCatalog, Run, RuntimeSnapshot, Topology } from "../shared/contracts.js";
 import { api } from "./api.js";
 import { ConfigureView } from "./components/ConfigureView.js";
 import { WorkView } from "./components/WorkView.js";
@@ -14,6 +14,7 @@ export function App() {
   const [activeTopologyId, setActiveTopologyId] = useState("");
   const [runs, setRuns] = useState<Run[]>([]);
   const [runtime, setRuntime] = useState<RuntimeSnapshot | null>(null);
+  const [catalogs, setCatalogs] = useState<ConnectorCatalog[]>([]);
   const [loading, setLoading] = useState(true);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -29,15 +30,17 @@ export function App() {
 
   const load = useCallback(async () => {
     try {
-      const [topologyResult, runResult, runtimeResult] = await Promise.all([
+      const [topologyResult, runResult, runtimeResult, catalogResult] = await Promise.all([
         api.topologies(),
         api.runs(),
         api.runtime(),
+        api.catalogs(),
       ]);
       setTopologies(topologyResult.topologies);
       setActiveTopologyId(topologyResult.activeTopologyId);
       setRuns(runResult);
       setRuntime(runtimeResult);
+      setCatalogs(catalogResult);
       setFatalError(null);
     } catch (error) {
       setFatalError(error instanceof Error ? error.message : String(error));
@@ -170,6 +173,13 @@ export function App() {
             key={activeTopology.id}
             topology={activeTopology}
             runtime={runtime}
+            catalogs={catalogs}
+            onCatalog={(catalog) =>
+              setCatalogs((current) => [
+                ...current.filter((item) => item.connectorId !== catalog.connectorId),
+                catalog,
+              ])
+            }
             onSave={saveTopology}
             notify={notify}
           />

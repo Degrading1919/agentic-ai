@@ -15,6 +15,9 @@ import {
 import {
   AlertTriangle,
   Check,
+  Copy,
+  ServerCog,
+  X,
   CircleDot,
   MousePointer2,
   Plus,
@@ -24,6 +27,7 @@ import {
   Undo2,
 } from "lucide-react";
 import type {
+  ConnectorCatalog,
   NodeKind,
   RuntimeSnapshot,
   Topology,
@@ -36,6 +40,7 @@ import {
   suggestedRelationship,
   validateTopology,
 } from "../../shared/topology.js";
+import { estimateAgentFootprint, type AgentFootprint } from "../../shared/prompt.js";
 import { api } from "../api.js";
 import { createNode, edgeStyle, nodeMeta, relationshipColor } from "../node-meta.js";
 import { CanvasNode, type CanvasNodeType } from "./CanvasNode.js";
@@ -44,14 +49,54 @@ import { Inspector } from "./Inspector.js";
 type Props = {
   topology: Topology;
   runtime: RuntimeSnapshot | null;
+  catalogs: ConnectorCatalog[];
+  onCatalog: (catalog: ConnectorCatalog) => void;
   onSave: (topology: Topology) => Promise<{ topology: Topology; issues: ValidationIssue[] }>;
   notify: (tone: "success" | "error" | "info", message: string) => void;
 };
 
+type LlamaSwapConfig = Awaited<ReturnType<typeof api.llamaSwapConfig>>;
+
+function LlamaSwapDialog({ config, onClose }: { config: LlamaSwapConfig; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" role="dialog" aria-label="llama-swap configuration" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <div><span className="eyebrow">Model lifecycle</span><h2>llama-swap config.yaml</h2></div>
+          <button className="icon-button" title="Close" onClick={onClose}><X size={15} /></button>
+        </header>
+        <p className="modal-copy">
+          Generated from Model nodes set to <strong>llama-swap managed</strong> with a local artifact path. llama-swap starts and stops
+          llama-server processes; Agentic Harness keeps scheduling, residency budgets, and idle unloads.
+        </p>
+        {config.skipped.length > 0 && (
+          <p className="modal-copy muted">Skipped: {config.skipped.map((item) => `${item.model} (${item.reason})`).join(", ")}</p>
+        )}
+        <pre className="code-block">{config.yaml}</pre>
+        <div className="modal-actions">
+          <button
+            className="secondary-button"
+            onClick={() => {
+              void navigator.clipboard?.writeText(config.yaml).then(() => setCopied(true));
+            }}
+          >
+            {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? "Copied" : "Copy YAML"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const nodeTypes = { capabilityNode: CanvasNode };
 const paletteOrder: NodeKind[] = ["agent", "model", "capability", "skill", "connector", "storage"];
 
-function toFlowNode(node: TopologyNode, selected: boolean): CanvasNodeType {
+function toFlowNode(
+  node: TopologyNode,
+  selected: boolean,
+  footprint: AgentFootprint | null,
+): CanvasNodeType {
   return {
     id: node.id,
     type: "capabilityNode",
@@ -79,7 +124,7 @@ function toFlowNode(node: TopologyNode, selected: boolean): CanvasNodeType {
       },
     ],
     selected,
-    data: { topologyNode: node },
+    data: { topologyNode: node, footprint },
   };
 }
 
@@ -118,19 +163,33 @@ function IssueList({ issues, onSelect }: { issues: ValidationIssue[]; onSelect: 
   );
 }
 
-export function ConfigureView({ topology, runtime, onSave, notify }: Props) {
+export function ConfigureView({ topology, runtime, catalogs, onCatalog, onSave, notify }: Props) {
   const [draft, setDraft] = useState<Topology>(() => structuredClone(topology));
   const [saved, setSaved] = useState<Topology>(() => structuredClone(topology));
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [swapConfig, setSwapConfig] = useState<LlamaSwapConfig | null>(null);
 
   const issues = useMemo(() => validateTopology(draft), [draft]);
   const errors = issues.filter((issue) => issue.severity === "error");
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(saved), [draft, saved]);
+  // Live static context cost per agent, from the same builder the runtime uses.
+  const footprints = useMemo(() => {
+    const map = new Map<string, AgentFootprint>();
+    for (const node of draft.nodes) {
+      if (node.kind !== "agent") continue;
+      const footprint = estimateAgentFootprint(draft, node.id, catalogs);
+      if (footprint) map.set(node.id, footprint);
+    }
+    return map;
+  }, [draft, catalogs]);
   const flowNodes = useMemo(
-    () => draft.nodes.map((node) => toFlowNode(node, selectedNodeId === node.id)),
-    [draft.nodes, selectedNodeId],
+    () =>
+      draft.nodes.map((node) =>
+        toFlowNode(node, selectedNodeId === node.id, footprints.get(node.id) ?? null),
+      ),
+    [draft.nodes, selectedNodeId, footprints],
   );
   const flowEdges = useMemo(
     () => draft.edges.map((edge) => toFlowEdge(edge, selectedEdgeId === edge.id)),
@@ -246,6 +305,30 @@ export function ConfigureView({ topology, runtime, onSave, notify }: Props) {
     }
   };
 
+  /** Discovery runs against the saved connector configuration. */
+  const discover = async (node: TopologyNode): Promise<ConnectorCatalog | null> => {
+    if (node.kind !== "connector") return null;
+    try {
+      const savedTopology = dirty ? await save() : saved;
+      const catalog = await api.discoverConnector(savedTopology.id, node.id);
+      onCatalog(catalog);
+      notify(catalog.error ? "error" : "success", catalog.error ?? `Discovered ${catalog.tools.length} tools from ${node.name}.`);
+      return catalog;
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : String(error));
+      return null;
+    }
+  };
+
+  const openLlamaSwap = async () => {
+    try {
+      const savedTopology = dirty ? await save() : saved;
+      setSwapConfig(await api.llamaSwapConfig(savedTopology.id));
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : String(error));
+    }
+  };
+
   const reset = () => {
     setDraft(structuredClone(saved));
     selectNothing();
@@ -304,6 +387,7 @@ export function ConfigureView({ topology, runtime, onSave, notify }: Props) {
             {dirty && <span className="unsaved-indicator"><CircleDot size={12} /> unsaved</span>}
             <button className="icon-button" title="Discard unsaved changes" disabled={!dirty} onClick={reset}><Undo2 size={15} /></button>
             <button className="icon-button" title="Redo is not available yet" disabled><Redo2 size={15} /></button>
+            <button className="secondary-button" title="Generate a llama-swap config for local model artifacts" onClick={() => void openLlamaSwap()}><ServerCog size={13} /> llama-swap</button>
             <button className="primary-button" disabled={saving || !dirty} onClick={() => void save()}><Save size={14} />{saving ? "Saving…" : "Save topology"}</button>
           </div>
         </header>
@@ -355,8 +439,12 @@ export function ConfigureView({ topology, runtime, onSave, notify }: Props) {
           onUpdateEdge={(edge) => setDraft((current) => ({ ...current, edges: current.edges.map((candidate) => candidate.id === edge.id ? edge : candidate) }))}
           onDelete={deleteSelected}
           onTestModel={testModel}
+          footprint={selectedNode ? footprints.get(selectedNode.id) ?? null : null}
+          catalog={selectedNode?.kind === "connector" ? catalogs.find((item) => item.connectorId === selectedNode.id) ?? null : null}
+          onDiscover={discover}
         />
       </aside>
+      {swapConfig && <LlamaSwapDialog config={swapConfig} onClose={() => setSwapConfig(null)} />}
     </div>
   );
 }

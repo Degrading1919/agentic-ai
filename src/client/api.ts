@@ -1,4 +1,5 @@
 import type {
+  ConnectorCatalog,
   CreateRunRequest,
   Run,
   RuntimeSnapshot,
@@ -34,7 +35,7 @@ export const api = {
   },
 
   async runs(): Promise<Run[]> {
-    const result = await request<{ runs: Run[] }>("/api/runs?limit=100");
+    const result = await request<{ runs: Run[] }>("/api/runs?limit=100&view=summary");
     return result.runs;
   },
 
@@ -81,4 +82,55 @@ export const api = {
       { method: "POST" },
     );
   },
+
+  async catalogs(): Promise<ConnectorCatalog[]> {
+    const result = await request<{ catalogs: ConnectorCatalog[] }>("/api/catalogs");
+    return result.catalogs;
+  },
+
+  async discoverConnector(topologyId: string, connectorId: string): Promise<ConnectorCatalog> {
+    const response = await fetch(
+      `/api/topologies/${encodeURIComponent(topologyId)}/connectors/${encodeURIComponent(connectorId)}/discover`,
+      { method: "POST" },
+    );
+    const payload = (await response.json()) as { catalog?: ConnectorCatalog; error?: string };
+    // A failed discovery still returns the recorded (error) catalog.
+    if (payload.catalog) return payload.catalog;
+    throw new Error(payload.error ?? `Discovery failed with HTTP ${response.status}.`);
+  },
+
+  async inspectModel(path: string, contextWindow?: number): Promise<ModelInspection> {
+    const result = await request<{ inspection: ModelInspection }>("/api/models/inspect", {
+      method: "POST",
+      body: JSON.stringify({ path, contextWindow }),
+    });
+    return result.inspection;
+  },
+
+  async llamaSwapConfig(
+    topologyId: string,
+  ): Promise<{ yaml: string; included: string[]; skipped: Array<{ model: string; reason: string }> }> {
+    return request(`/api/topologies/${encodeURIComponent(topologyId)}/llama-swap-config`);
+  },
+};
+
+/** Mirrors the server's GGUF inspection payload. */
+export type ModelInspection = {
+  path: string;
+  fileSizeMb: number;
+  ggufVersion: number;
+  architecture: string;
+  name: string;
+  parameterLabel: string;
+  quantization: string;
+  trainedContextLength: number;
+  blockCount: number | null;
+  embeddingLength: number | null;
+  headCount: number | null;
+  headCountKv: number | null;
+  baseModel: string;
+  isAdapter: boolean;
+  estimatedMemoryMb: number;
+  kvCacheMb: number;
+  contextWindowForEstimate: number;
 };
