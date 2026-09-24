@@ -83,6 +83,10 @@ export const api = {
     );
   },
 
+  async createExampleTopology(): Promise<{ topology: Topology; issues: ValidationIssue[] }> {
+    return request("/api/topologies/example", { method: "POST" });
+  },
+
   async catalogs(): Promise<ConnectorCatalog[]> {
     const result = await request<{ catalogs: ConnectorCatalog[] }>("/api/catalogs");
     return result.catalogs;

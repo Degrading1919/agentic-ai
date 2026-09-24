@@ -9,8 +9,8 @@ import {
   topologySchema,
   type ConnectorNode,
   type ModelNode,
-  type Run,
 } from "../shared/contracts.js";
+import { createDemoTopology } from "../shared/demo-topology.js";
 import { estimateAgentFootprint } from "../shared/prompt.js";
 import { validateTopology } from "../shared/topology.js";
 import { inspectGguf } from "./gguf.js";
@@ -81,25 +81,22 @@ app.put<{ Params: { topologyId: string }; Body: unknown }>(
   },
 );
 
-/** List view: drop heavy per-run detail; clients fetch one run in full when it changes. */
-function runSummary(run: Run): Run {
-  return {
-    ...run,
-    workOrders: [],
-    messages: [],
-    events: run.events.slice(-1),
-    contextFrames: [],
-    plans: [],
-    reports: [],
-    artifacts: [],
-    result: null,
-  };
-}
+// Adds a fresh copy of the example topology without touching existing ones.
+app.post("/api/topologies/example", async (_request, reply) => {
+  const topology = createDemoTopology();
+  const existing = new Set(store.listTopologies().map((item) => item.id));
+  let suffix = 1;
+  while (existing.has(`${topology.id}-${suffix}`)) suffix += 1;
+  topology.id = existing.has(topology.id) ? `${topology.id}-${suffix}` : topology.id;
+  topology.name = existing.size ? `${topology.name} (example)` : topology.name;
+  const saved = await store.saveTopology(topology);
+  return reply.status(201).send({ topology: saved, issues: validateTopology(saved) });
+});
 
+// `view=summary` drops heavy per-run detail; clients fetch one run in full when it changes.
 app.get<{ Querystring: { limit?: string; view?: string } }>("/api/runs", async (request) => {
   const limit = Math.max(1, Math.min(200, Number(request.query.limit ?? 50) || 50));
-  const runs = store.listRuns(limit);
-  return { runs: request.query.view === "summary" ? runs.map(runSummary) : runs };
+  return { runs: request.query.view === "summary" ? store.listRunSummaries(limit) : store.listRuns(limit) };
 });
 
 app.get<{ Params: { runId: string } }>("/api/runs/:runId", async (request, reply) => {

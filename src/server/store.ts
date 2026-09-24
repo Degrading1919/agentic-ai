@@ -11,7 +11,6 @@ function clone<T>(value: T): T {
 export class LocalStore {
   readonly dataDir: string;
   readonly statePath: string;
-  readonly artifactDir: string;
   private state: AppState | null = null;
   private writeChain: Promise<void> = Promise.resolve();
 
@@ -22,11 +21,10 @@ export class LocalStore {
         path.join(process.cwd(), ".agentic-harness"),
     );
     this.statePath = path.join(this.dataDir, "state.json");
-    this.artifactDir = path.join(this.dataDir, "artifacts");
   }
 
   async init(): Promise<void> {
-    await mkdir(this.artifactDir, { recursive: true });
+    await mkdir(this.dataDir, { recursive: true });
     try {
       const raw = await readFile(this.statePath, "utf8");
       this.state = appStateSchema.parse(JSON.parse(raw));
@@ -94,7 +92,9 @@ export class LocalStore {
   async saveCatalog(catalog: ConnectorCatalog): Promise<ConnectorCatalog> {
     return this.enqueueMutation((state) => {
       state.connectorCatalogs = [
-        ...state.connectorCatalogs.filter((item) => item.connectorId !== catalog.connectorId),
+        ...state.connectorCatalogs.filter(
+          (item) => !(item.connectorId === catalog.connectorId && item.fingerprint === catalog.fingerprint),
+        ),
         clone(catalog),
       ];
       return catalog;
@@ -126,6 +126,42 @@ export class LocalStore {
       [...this.requireState().runs]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
         .slice(0, limit),
+    );
+  }
+
+  /**
+   * List view without heavy per-run detail. Projection happens before
+   * cloning, so polling does not copy every context frame and message.
+   */
+  listRunSummaries(limit = 50): Run[] {
+    return [...this.requireState().runs]
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit)
+      .map((run) =>
+        clone({
+          ...run,
+          workOrders: [],
+          messages: [],
+          events: run.events.slice(-1),
+          contextFrames: [],
+          plans: [],
+          reports: [],
+          artifacts: [],
+          result: null,
+        }),
+      );
+  }
+
+  hasRunWithStatus(status: Run["status"]): boolean {
+    return this.requireState().runs.some((run) => run.status === status);
+  }
+
+  /** Runs in a thread (the thread root plus follow-ups), newest first. */
+  listThread(threadId: string): Run[] {
+    return clone(
+      this.requireState()
+        .runs.filter((run) => run.threadId === threadId || run.id === threadId)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     );
   }
 
@@ -161,21 +197,5 @@ export class LocalStore {
       run.updatedAt = new Date().toISOString();
       return run;
     });
-  }
-
-  async writeRunArtifact(
-    runId: string,
-    filename: "final.md" | "conversation.json",
-    content: string,
-  ): Promise<string> {
-    const safeRunId = runId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const runDirectory = path.resolve(this.artifactDir, safeRunId);
-    if (!runDirectory.startsWith(`${this.artifactDir}${path.sep}`)) {
-      throw new Error("Artifact path escaped the configured data directory.");
-    }
-    await mkdir(runDirectory, { recursive: true });
-    const artifactPath = path.join(runDirectory, filename);
-    await writeFile(artifactPath, content, "utf8");
-    return artifactPath;
   }
 }

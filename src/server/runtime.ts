@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   type AccessMode,
   type ToolDescriptor,
-  connectorFingerprint,
+  catalogFor,
   isMetaTool,
   resolveToolDescriptors,
   searchDescriptors,
@@ -228,7 +228,7 @@ export class RuntimeEngine {
   }
 
   snapshot(): RuntimeSnapshot {
-    const hasPaused = this.store.listRuns(10_000).some((run) => run.status === "paused");
+    const hasPaused = this.store.hasRunWithStatus("paused");
     return {
       status: this.active.size > 0 ? "working" : hasPaused ? "paused" : "idle",
       queuedRunIds: [...this.queue],
@@ -663,8 +663,8 @@ export class RuntimeEngine {
     for (const connector of context.connectors) {
       if (signal.aborted) return;
       if (!connector.config.enabled || connector.config.connectorType !== "mcp") continue;
-      const catalog = catalogs.find((candidate) => candidate.connectorId === connector.id);
-      if (catalog && !catalog.error && catalog.fingerprint === connectorFingerprint(connector)) continue;
+      const catalog = catalogFor(connector, catalogs);
+      if (catalog && !catalog.error) continue;
       try {
         const discovered = await this.mcp.discover(connector);
         await this.store.saveCatalog(discovered);
@@ -1706,7 +1706,7 @@ export class RuntimeEngine {
     const run = this.store.getRun(runId);
     if (!run) return "ERROR: run unavailable.";
     const threadRuns = run.threadId
-      ? this.store.listRuns(10_000).filter((candidate) => candidate.threadId === run.threadId || candidate.id === run.threadId)
+      ? this.store.listThread(run.threadId)
       : [run];
     for (const candidate of [run, ...threadRuns]) {
       const order = candidate.workOrders.find((item) => item.id === id);
@@ -1883,17 +1883,23 @@ export class RuntimeEngine {
     const topology = this.store.getTopology(run.topologyId);
     const context = topology ? getAgentContext(topology, run.entryAgentId) : null;
     const persist = context?.agent.config.conversationPersistence === "connected-storage";
-    const writable = context?.storage.some(
-      ({ node, edge }) => edge.permissions?.write && node.config.storageType !== "memory" && node.config.storageType !== "vector-store",
-    );
+    // Archives go through the storage adapter, inside the entry agent's
+    // granted scope, on the first writable file-backed storage edge.
+    const target = [...(context?.storage ?? [])]
+      .filter(
+        ({ node, edge }) =>
+          edge.permissions?.write && ["artifact-store", "project-files", "git"].includes(node.config.storageType),
+      )
+      .sort((a, b) => a.node.id.localeCompare(b.node.id) || a.edge.id.localeCompare(b.edge.id))[0];
     const artifactPaths: string[] = [];
     const archives: ArtifactRecord[] = [];
     // Artifacts are written before the run is marked completed so observers
     // never see a completed run with missing files.
-    if (persist && writable) {
-      const finalPath = await this.store.writeRunArtifact(runId, "final.md", `# ${run.objective}\n\n${result}\n`);
-      const conversationPath = await this.store.writeRunArtifact(
-        runId,
+    if (persist && target) {
+      const write = async (name: string, content: string) =>
+        (await this.storage.write(target.node, target.edge, `${runId}/${name}`, content)).path;
+      const finalPath = await write("final.md", `# ${run.objective}\n\n${result}\n`);
+      const conversationPath = await write(
         "conversation.json",
         `${JSON.stringify(
           {
@@ -1920,7 +1926,7 @@ export class RuntimeEngine {
           agentId: run.entryAgentId,
           name,
           kind: "archive",
-          storageNodeId: null,
+          storageNodeId: target.node.id,
           path,
           summary: "",
           tokens: 0,

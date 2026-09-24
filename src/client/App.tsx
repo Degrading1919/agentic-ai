@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, Network, PanelsTopLeft, Sparkles } from "lucide-react";
+import { Activity, CopyPlus, Network, PanelsTopLeft, Sparkles } from "lucide-react";
 import type { ConnectorCatalog, Run, RuntimeSnapshot, Topology } from "../shared/contracts.js";
 import { api } from "./api.js";
 import { ConfigureView } from "./components/ConfigureView.js";
@@ -98,6 +98,17 @@ export function App() {
     [notify],
   );
 
+  const addExample = useCallback(async () => {
+    try {
+      const result = await api.createExampleTopology();
+      setTopologies((current) => [...current, result.topology]);
+      setActiveTopologyId(result.topology.id);
+      notify("success", `Added "${result.topology.name}".`);
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : String(error));
+    }
+  }, [notify]);
+
   if (loading) {
     return (
       <main className="boot-screen">
@@ -152,6 +163,9 @@ export function App() {
               <option key={topology.id} value={topology.id}>{topology.name}</option>
             ))}
           </select>
+          <button className="icon-button" title="Add the example topology" onClick={() => void addExample()}>
+            <CopyPlus size={14} />
+          </button>
           <div className={`runtime-pill ${runtime?.status ?? "idle"}`}>
             <Activity size={14} />
             <span>{runtime?.status ?? "offline"}</span>
@@ -176,7 +190,9 @@ export function App() {
             catalogs={catalogs}
             onCatalog={(catalog) =>
               setCatalogs((current) => [
-                ...current.filter((item) => item.connectorId !== catalog.connectorId),
+                ...current.filter(
+                  (item) => !(item.connectorId === catalog.connectorId && item.fingerprint === catalog.fingerprint),
+                ),
                 catalog,
               ])
             }

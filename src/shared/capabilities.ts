@@ -93,9 +93,14 @@ export function catalogFor(
   connector: ConnectorNode,
   catalogs: ConnectorCatalog[],
 ): ConnectorCatalog | null {
-  const catalog = catalogs.find((candidate) => candidate.connectorId === connector.id);
-  if (!catalog || catalog.fingerprint !== connectorFingerprint(connector)) return null;
-  return catalog;
+  // Catalogs are keyed by connector and configuration, so a changed endpoint
+  // or command never reuses tools discovered from a different server.
+  const fingerprint = connectorFingerprint(connector);
+  return (
+    catalogs.find(
+      (candidate) => candidate.connectorId === connector.id && candidate.fingerprint === fingerprint,
+    ) ?? null
+  );
 }
 
 export const calculatorTool = {
