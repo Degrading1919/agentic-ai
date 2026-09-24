@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { StorageNode, TopologyEdge } from "../shared/contracts.js";
 import { slugify } from "../shared/capabilities.js";
@@ -8,6 +7,7 @@ import { slugify } from "../shared/capabilities.js";
 export const MAX_READ_BYTES = 64 * 1024;
 export const MAX_WRITE_BYTES = 256 * 1024;
 const MAX_LIST_ENTRIES = 200;
+const MAX_SEGMENTS = 32;
 
 export type MemoryEntry = {
   id: string;
@@ -28,26 +28,68 @@ export class StorageBoundaryError extends Error {
 const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
 
 function comparable(value: string): string {
-  return caseInsensitive ? value.toLowerCase() : value;
+  const resolved = path.resolve(value);
+  return caseInsensitive ? resolved.toLowerCase() : resolved;
 }
 
 export function isInside(root: string, candidate: string): boolean {
-  const normalizedRoot = comparable(path.resolve(root));
-  const normalizedCandidate = comparable(path.resolve(candidate));
+  const normalizedRoot = comparable(root);
+  const normalizedCandidate = comparable(candidate);
   return (
     normalizedCandidate === normalizedRoot ||
-    normalizedCandidate.startsWith(`${normalizedRoot}${path.sep}`)
+    normalizedCandidate.startsWith(normalizedRoot.endsWith(path.sep) ? normalizedRoot : `${normalizedRoot}${path.sep}`)
   );
+}
+
+const windowsReserved = /^(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/i;
+// eslint-disable-next-line no-control-regex
+const forbiddenCharacters = /[<>"|?*\u0000-\u001f]/;
+
+/**
+ * Validate a scope or path lexically and return its segments.
+ *
+ * Rejected on every platform so behaviour does not depend on the host:
+ * drive-qualified paths (`C:`, `C:/x`), UNC and device paths (`//server`,
+ * `\\?\`, `\\.\`), `..`, colons (drive letters and NTFS alternate data
+ * streams), control and wildcard characters, reserved Windows device names,
+ * and segments ending in a dot or space (Windows silently strips them).
+ */
+export function validateRelativeSegments(
+  input: string | undefined,
+  kind: "scope" | "path",
+): string[] {
+  const raw = input ?? "";
+  const normalized = raw.replaceAll("\\", "/");
+  if (/^\/\//.test(normalized)) {
+    throw new StorageBoundaryError(`UNC and device paths are not allowed in a storage ${kind}.`);
+  }
+  if (/^[a-zA-Z]:/.test(normalized)) {
+    throw new StorageBoundaryError(`Drive-qualified paths are not allowed in a storage ${kind}.`);
+  }
+  if (kind === "path" && normalized.startsWith("/")) {
+    throw new StorageBoundaryError("Paths must be relative to the storage scope.");
+  }
+  const segments = normalized.split("/").filter((segment) => segment.length > 0 && segment !== ".");
+  if (segments.length > MAX_SEGMENTS) throw new StorageBoundaryError(`The ${kind} is nested too deeply.`);
+  for (const segment of segments) {
+    if (segment === "..") throw new StorageBoundaryError(`'..' is not allowed in a storage ${kind}.`);
+    if (segment.includes(":")) {
+      throw new StorageBoundaryError(`':' is not allowed in a storage ${kind} (drive letters and alternate streams).`);
+    }
+    if (forbiddenCharacters.test(segment)) {
+      throw new StorageBoundaryError(`The ${kind} contains a character that is not allowed: '${segment}'.`);
+    }
+    if (windowsReserved.test(segment)) throw new StorageBoundaryError(`'${segment}' is a reserved device name.`);
+    if (/[. ]$/.test(segment)) {
+      throw new StorageBoundaryError(`Segments may not end with a dot or space: '${segment}'.`);
+    }
+  }
+  return segments;
 }
 
 /** Normalize an edge scope ("/runs", "runs/", "") to a relative POSIX-style path. */
 export function normalizeScope(scope: string | undefined): string {
-  const parts = (scope ?? "/")
-    .replaceAll("\\", "/")
-    .split("/")
-    .filter((part) => part && part !== ".");
-  if (parts.includes("..")) throw new StorageBoundaryError("Storage scope may not contain '..'.");
-  return parts.join("/");
+  return validateRelativeSegments(scope ?? "/", "scope").join("/");
 }
 
 const stopWords = new Set(
@@ -103,10 +145,23 @@ export function rankByBm25<T>(
     .map(({ item, score }) => ({ item, score: Math.round(score * 1_000) / 1_000 }));
 }
 
+function isMissing(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
 /**
  * Physical storage adapters behind storage edges. Every call receives the
  * edge so read/write permissions and scope are enforced at the adapter, not
  * only in prompt text.
+ *
+ * Containment model: the node's configured location is trusted (the topology
+ * editor chose it) and is canonicalized once. Below it, every path component
+ * — scope and requested path alike — is resolved one step at a time with
+ * `lstat`; symbolic links and junctions are never followed, and each existing
+ * component's real path must equal its lexical path (which also rejects
+ * mount points and other reparse points). Reads and writes re-validate after
+ * opening or before renaming to narrow time-of-check/time-of-use races.
  */
 export class StorageService {
   readonly workspaceRoot: string;
@@ -139,37 +194,61 @@ export class StorageService {
     }
   }
 
-  private scopedRoot(node: StorageNode, edge: TopologyEdge): string {
-    const scope = normalizeScope(edge.permissions?.scope);
-    return path.resolve(this.rootFor(node), scope);
+  private async canonicalRoot(node: StorageNode): Promise<string> {
+    const root = this.rootFor(node);
+    await mkdir(root, { recursive: true });
+    return realpath(root);
   }
 
-  private async resolveInside(
-    node: StorageNode,
-    edge: TopologyEdge,
-    relativePath: string,
-  ): Promise<{ root: string; target: string }> {
-    const root = this.scopedRoot(node, edge);
-    const cleaned = (relativePath || ".").replaceAll("\\", "/");
-    if (path.isAbsolute(cleaned) || /^[a-zA-Z]:/.test(cleaned) || cleaned.startsWith("//")) {
-      throw new StorageBoundaryError("Paths must be relative to the storage scope.");
-    }
-    const target = path.resolve(root, cleaned.replace(/^\/+/, ""));
-    if (!isInside(root, target)) {
-      throw new StorageBoundaryError(`Path '${relativePath}' escapes the granted scope.`);
-    }
-    // Resolve symlinks on the nearest existing ancestor so links cannot escape.
-    let probe = target;
-    while (!existsSync(probe) && isInside(root, path.dirname(probe)) && probe !== root) {
-      probe = path.dirname(probe);
-    }
-    if (existsSync(probe) && existsSync(root)) {
-      const [realRoot, realProbe] = await Promise.all([realpath(root), realpath(probe)]);
-      if (!isInside(realRoot, realProbe)) {
-        throw new StorageBoundaryError(`Path '${relativePath}' resolves outside the granted scope.`);
+  /**
+   * Resolve segments below a canonical root without following links.
+   * Missing trailing components are allowed (the path may be created later)
+   * unless `createDirectories` asks for the parents to be created safely.
+   */
+  private async walk(realRoot: string, segments: string[], createDirectories: boolean): Promise<string> {
+    let current = realRoot;
+    for (const [index, segment] of segments.entries()) {
+      const next = path.join(current, segment);
+      let info: Awaited<ReturnType<typeof lstat>>;
+      try {
+        info = await lstat(next);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        const isParent = index < segments.length - 1;
+        if (!(createDirectories && isParent)) {
+          return path.join(current, ...segments.slice(index));
+        }
+        try {
+          await mkdir(next);
+        } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+        }
+        info = await lstat(next);
       }
+      if (info.isSymbolicLink()) {
+        throw new StorageBoundaryError(
+          `'${segments.slice(0, index + 1).join("/")}' is a link or junction; storage never follows links.`,
+        );
+      }
+      const real = await realpath(next);
+      if (comparable(real) !== comparable(next)) {
+        throw new StorageBoundaryError(
+          `'${segments.slice(0, index + 1).join("/")}' resolves elsewhere (reparse point); access denied.`,
+        );
+      }
+      if (index < segments.length - 1 && !info.isDirectory()) {
+        throw new StorageBoundaryError(`'${segments.slice(0, index + 1).join("/")}' is not a directory.`);
+      }
+      current = next;
     }
-    return { root, target };
+    if (!isInside(realRoot, current)) throw new StorageBoundaryError("Path escapes the storage root.");
+    return current;
+  }
+
+  private segmentsFor(edge: TopologyEdge, relativePath: string): { scope: string[]; target: string[] } {
+    const scope = validateRelativeSegments(edge.permissions?.scope ?? "/", "scope");
+    const target = validateRelativeSegments(relativePath || ".", "path");
+    return { scope, target };
   }
 
   private requirePermission(edge: TopologyEdge, permission: "read" | "write", node: StorageNode) {
@@ -182,31 +261,63 @@ export class StorageService {
 
   async list(node: StorageNode, edge: TopologyEdge, relativePath = "."): Promise<string> {
     this.requirePermission(edge, "read", node);
-    const { root, target } = await this.resolveInside(node, edge, relativePath);
-    if (!existsSync(target)) return relativePath === "." ? "(empty)" : `Not found: ${relativePath}`;
-    const info = await stat(target);
-    if (!info.isDirectory()) return `${path.relative(root, target).replaceAll("\\", "/")} (file, ${info.size} bytes)`;
-    const entries = await readdir(target, { withFileTypes: true });
+    const { scope, target } = this.segmentsFor(edge, relativePath);
+    const realRoot = await this.canonicalRoot(node);
+    const scopeRoot = await this.walk(realRoot, scope, false);
+    const resolved = await this.walk(realRoot, [...scope, ...target], false);
+    let info: Awaited<ReturnType<typeof lstat>>;
+    try {
+      info = await lstat(resolved);
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+      return target.length === 0 ? "(empty)" : `Not found: ${relativePath}`;
+    }
+    const display = (absolute: string) => path.relative(scopeRoot, absolute).replaceAll("\\", "/");
+    if (!info.isDirectory()) return `${display(resolved)} (file, ${info.size} bytes)`;
+    const entries = await readdir(resolved, { withFileTypes: true });
     const lines = entries
       .filter((entry) => !entry.name.startsWith(".tmp-"))
       .sort((a, b) => a.name.localeCompare(b.name))
       .slice(0, MAX_LIST_ENTRIES)
-      .map((entry) => `${entry.isDirectory() ? "dir " : "file"} ${path.relative(root, path.join(target, entry.name)).replaceAll("\\", "/")}`);
+      .map((entry) => {
+        const kind = entry.isSymbolicLink() ? "link" : entry.isDirectory() ? "dir " : "file";
+        return `${kind} ${display(path.join(resolved, entry.name))}${entry.isSymbolicLink() ? " (not followed)" : ""}`;
+      });
     const more = entries.length > MAX_LIST_ENTRIES ? `\n… ${entries.length - MAX_LIST_ENTRIES} more` : "";
     return lines.length ? `${lines.join("\n")}${more}` : "(empty)";
   }
 
   async read(node: StorageNode, edge: TopologyEdge, relativePath: string): Promise<string> {
     this.requirePermission(edge, "read", node);
-    const { target } = await this.resolveInside(node, edge, relativePath);
-    if (!existsSync(target)) throw new StorageBoundaryError(`File not found: ${relativePath}`);
-    const info = await stat(target);
+    const { scope, target } = this.segmentsFor(edge, relativePath);
+    if (target.length === 0) throw new StorageBoundaryError("A file path is required.");
+    const realRoot = await this.canonicalRoot(node);
+    const resolved = await this.walk(realRoot, [...scope, ...target], false);
+    let info: Awaited<ReturnType<typeof lstat>>;
+    try {
+      info = await lstat(resolved);
+    } catch (error) {
+      if (isMissing(error)) throw new StorageBoundaryError(`File not found: ${relativePath}`);
+      throw error;
+    }
     if (!info.isFile()) throw new StorageBoundaryError(`Not a file: ${relativePath}`);
-    const buffer = await readFile(target);
-    const text = buffer.subarray(0, MAX_READ_BYTES).toString("utf8");
-    return buffer.length > MAX_READ_BYTES
-      ? `${text}\n[…truncated: ${buffer.length} bytes total]`
-      : text;
+    const handle = await open(resolved, "r");
+    try {
+      // Re-validate after opening: the opened object must still be the file we checked.
+      const again = await this.walk(realRoot, [...scope, ...target], false);
+      const [opened, current] = await Promise.all([handle.stat({ bigint: true }), stat(again, { bigint: true })]);
+      if (opened.ino !== current.ino || opened.dev !== current.dev) {
+        throw new StorageBoundaryError("The file changed while it was being opened; access denied.");
+      }
+      const buffer = Buffer.alloc(Math.min(Number(opened.size), MAX_READ_BYTES));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      const text = buffer.subarray(0, bytesRead).toString("utf8");
+      return Number(opened.size) > MAX_READ_BYTES
+        ? `${text}\n[…truncated: ${opened.size} bytes total]`
+        : text;
+    } finally {
+      await handle.close();
+    }
   }
 
   async write(
@@ -220,23 +331,64 @@ export class StorageService {
     if (bytes > MAX_WRITE_BYTES) {
       throw new StorageBoundaryError(`Write exceeds the ${MAX_WRITE_BYTES}-byte limit.`);
     }
-    const { root, target } = await this.resolveInside(node, edge, relativePath);
-    if (target === root) throw new StorageBoundaryError("A file name is required.");
-    await mkdir(path.dirname(target), { recursive: true });
-    const temporary = path.join(path.dirname(target), `.tmp-${randomUUID()}`);
-    await writeFile(temporary, content, "utf8");
-    await rename(temporary, target);
-    return { path: target, bytes };
+    const { scope, target } = this.segmentsFor(edge, relativePath);
+    if (target.length === 0) throw new StorageBoundaryError("A file name is required.");
+    const realRoot = await this.canonicalRoot(node);
+    const segments = [...scope, ...target];
+    const destination = await this.walk(realRoot, segments, true);
+    try {
+      const existing = await lstat(destination);
+      if (existing.isSymbolicLink() || !existing.isFile()) {
+        throw new StorageBoundaryError(`'${relativePath}' exists and is not a regular file.`);
+      }
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    const parent = path.dirname(destination);
+    const temporary = path.join(parent, `.tmp-${randomUUID()}`);
+    // `wx` creates a new file exclusively; it can never write through an existing link.
+    const handle = await open(temporary, "wx");
+    try {
+      await handle.writeFile(content, "utf8");
+    } finally {
+      await handle.close();
+    }
+    try {
+      // Re-validate the parent chain immediately before publishing the file.
+      const parentAgain = await this.walk(realRoot, segments.slice(0, -1), false);
+      if (comparable(parentAgain) !== comparable(parent)) {
+        throw new StorageBoundaryError("The destination changed while writing; access denied.");
+      }
+      await rename(temporary, destination);
+    } catch (error) {
+      await unlink(temporary).catch(() => undefined);
+      throw error;
+    }
+    return { path: destination, bytes };
   }
 
-  private memoryFile(node: StorageNode): string {
-    return path.join(this.rootFor(node), "memory.jsonl");
+  private async memoryFile(node: StorageNode): Promise<string> {
+    const realRoot = await this.canonicalRoot(node);
+    const file = path.join(realRoot, "memory.jsonl");
+    try {
+      if ((await lstat(file)).isSymbolicLink()) {
+        throw new StorageBoundaryError("The memory file is a link; storage never follows links.");
+      }
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    return file;
   }
 
   async readMemory(node: StorageNode): Promise<MemoryEntry[]> {
-    const file = this.memoryFile(node);
-    if (!existsSync(file)) return [];
-    const raw = await readFile(file, "utf8");
+    const file = await this.memoryFile(node);
+    let raw: string;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw error;
+    }
     return raw
       .split("\n")
       .filter(Boolean)
@@ -265,26 +417,34 @@ export class StorageService {
     );
   }
 
+  /**
+   * Append a note. With `entryId` (an operation ID) the append is idempotent:
+   * repeating it after an interrupted call returns the existing entry.
+   */
   async remember(
     node: StorageNode,
     edge: TopologyEdge,
     text: string,
     tags: string[],
     source: MemoryEntry["source"],
+    entryId?: string,
   ): Promise<MemoryEntry> {
     this.requirePermission(edge, "write", node);
     const trimmed = text.trim();
     if (!trimmed) throw new StorageBoundaryError("Memory text is required.");
+    if (entryId) {
+      const existing = (await this.readMemory(node)).find((entry) => entry.id === entryId);
+      if (existing) return existing;
+    }
     const entry: MemoryEntry = {
-      id: randomUUID(),
+      id: entryId ?? randomUUID(),
       text: trimmed.slice(0, 4_000),
       tags: tags.map((tag) => tag.slice(0, 40)).slice(0, 8),
       scope: normalizeScope(edge.permissions?.scope),
       source,
       createdAt: new Date().toISOString(),
     };
-    const file = this.memoryFile(node);
-    await mkdir(path.dirname(file), { recursive: true });
+    const file = await this.memoryFile(node);
     await appendFile(file, `${JSON.stringify(entry)}\n`, "utf8");
     return entry;
   }
