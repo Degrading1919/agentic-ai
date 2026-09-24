@@ -57,6 +57,15 @@ Storage relationships must eventually support explicit permissions such as read,
 - Conversation persistence is configurable through connected storage.
 - The human controls topology optimization; agents do not redesign the graph autonomously.
 
+## Context efficiency principles
+
+- An edge **authorizes** a resource; it does not mean its full definition enters every prompt. Keep authorization (`resolveToolDescriptors`) separate from exposure (`planToolExposure`).
+- The topology is a security, hallucination, and context-budget boundary at once.
+- Keep the stable prompt prefix deterministic: topology-derived content only, sorted by ID, no timestamps or run data. Dynamic work-order content goes after it.
+- Treat context as a measured resource: every model call records a context frame, and Configure shows per-agent footprints computed by the same builder the runtime uses.
+- Invoke collaborators only when they add value; plans are validated against edges and capped.
+- Prefer structured state (work orders, summaries, verdicts, artifacts, memory) over replaying transcripts.
+
 ## Model strategy
 
 Custom user-trained/fine-tuned models are first-class artifacts.

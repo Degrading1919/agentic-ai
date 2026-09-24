@@ -4,31 +4,35 @@ Do not silently decide these during unrelated tasks.
 
 ## Inference abstraction
 
-Undecided:
+Decided for now: an OpenAI-compatible transport (`providers.ts`) serves llama.cpp, llama-swap, Ollama-compatible servers, LM Studio, and vLLM. llama-swap is the recommended process manager for local artifacts; the harness generates its configuration rather than managing llama-server processes itself.
 
-- llama.cpp
-- Ollama
-- LM Studio
-- vLLM
-- multiple backends behind an abstraction layer
-
-Current direction: design an abstraction, implement only one backend first.
+Still open: native adapters for backends whose OpenAI compatibility lacks features the harness wants (tokenize endpoints for exact counts, slot pinning for cache affinity).
 
 ## Desktop/backend packaging
 
-Candidate direction for early UI work:
+Candidate direction:
 
 - React + TypeScript
 - `@xyflow/react` for the node canvas
 - Tauri 2 for a lightweight desktop shell
 - a separate local runtime service may later be introduced for Python/ML orchestration
 
-Do not let the first UI task lock the runtime implementation to a specific inference server.
+The runtime currently ships as a local Fastify service serving the built UI.
 
 ## Persistence
 
-Storage node backends, graph persistence format, vector stores, Git-backed memory, and conversation archival formats remain open.
+Decided: storage adapters for artifact store, project files, and a local BM25 memory store (see the Storage section of `docs/ARCHITECTURE.md`).
+
+Still open: a database-backed state store for long histories, an embedding-based vector adapter, and Git commit semantics for the `git` storage type.
+
+## MCP
+
+Decided: the official MCP TypeScript SDK as the client, with stdio and Streamable HTTP transports, cached catalogs, and deferred exposure (ADR 006).
+
+Still open: MCP resources and prompts (tools only today), OAuth-based server authorization, and sampling requests from servers.
 
 ## A2A transport
 
-Relationship semantics are defined conceptually, but transport/protocol adoption is still open. Evaluate the current A2A standard before implementing a custom wire protocol.
+Decided: relationship semantics are implemented in-process on structured work orders (ADR 008).
+
+Still open: exposing agents or accepting remote agents over the Agent2Agent protocol. Work orders, verdicts, and artifacts were shaped to map onto A2A tasks and artifacts when that transport is added.

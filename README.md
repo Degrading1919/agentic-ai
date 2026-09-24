@@ -4,22 +4,38 @@ Agentic Harness is a local-first visual orchestration IDE for teams of specializ
 
 The graph is a **capability topology, not a workflow DAG**. An edge grants access to a model, tool, skill, connector, storage target, or another agent. Canvas position never grants permission and never defines execution order.
 
-## What works in the MVP
+The same edges form three boundaries at once:
 
-- Visual topology editing with React Flow
-- Models, agents, capabilities, skills, MCP/API connectors, and storage nodes
-- Typed agent relationships: delegate, consult, review, report, and handoff
-- Structural validation and hard runtime boundary checks
-- Separate model artifacts and agent configurations
-- OpenAI-compatible local inference for llama.cpp, llama-swap, Ollama-compatible endpoints, and similar servers
-- A deterministic built-in provider for trying the entire product without downloading a model
-- Structured, persisted work orders for lead-to-specialist execution
-- Connected tool calling with a safe calculator example
-- Durable run state, final artifacts, and optional conversation archives
-- Pause/resume with completed work preserved and current topology applied on resume
-- Deterministic model residency states, memory budgeting, idle eviction, and llama-swap unload calls
-- Live CPU/RAM, queue, model state, token, timing, and tool-call telemetry
-- Recovery of queued work after a local runtime restart
+- **Security**: an agent can use only what is connected to it, re-checked before every call.
+- **Hallucination**: a model is told only about what it can actually use.
+- **Context budget**: connecting a resource authorizes it, but does not automatically put its full definition into every prompt.
+
+## What works
+
+**Topology and workers**
+- Visual topology editing with React Flow: models, agents, capabilities, skills, MCP/HTTP connectors, and storage.
+- Separate model artifacts and agent configurations, including lineage metadata for custom fine-tunes.
+- Typed relationships with distinct runtime behaviour. **Delegate** keeps ownership, **consult** returns read-only advice, **review** returns structured verdicts and drives bounded revisions, **handoff** transfers ownership and the return path, and **report** delivers status to an inbox with no inference.
+- Planning that invokes only collaborators who add value: plans are validated against edges and capped, and skipped collaborators are shown.
+
+**Context efficiency**
+- Deferred capability discovery: large tool sets become a compact catalog plus `find_tools`/`call_tool`, so a 150-tool MCP server costs about a thousand tokens instead of about twenty thousand.
+- On-demand skills that cost one catalog line until a worker loads them.
+- A deterministic, cache-friendly prompt prefix per agent, with dynamic work-order data kept after it.
+- Per-agent context footprints in Configure, plus per-call context frames in Work: tokens by segment, prefix reuse, and server-reported cache hits.
+- Budget-aware packing with summaries and `read_artifact` references, thread digests and retrieved memory instead of transcript replay, and phase-based resume.
+
+**Capabilities and storage**
+- MCP client over stdio and Streamable HTTP (official SDK), with tool discovery, cached catalogs, per-tool allowlists, and read-only filtering.
+- HTTP API connector confined to its base URL and allowed methods.
+- Storage adapters for artifact stores and project folders with scope and symlink-escape enforcement, plus a local BM25 memory store.
+
+**Runtime and hardware**
+- OpenAI-compatible local inference (llama.cpp, llama-swap, Ollama-compatible, LM Studio, vLLM) and a deterministic offline demo model.
+- Deterministic scheduling: per-model parallel slots, RAM and VRAM budgets, LRU eviction, waiting for capacity instead of failing, and overlapping independent work when models fit.
+- NVIDIA GPU telemetry via `nvidia-smi`, alongside CPU and RAM.
+- GGUF inspection with KV-cache memory estimates, and llama-swap config generation.
+- Durable runs, pause/resume with completed work preserved, and recovery after a restart.
 
 ## Quick start
 
@@ -44,7 +60,7 @@ pnpm start
 
 Then open [http://127.0.0.1:8787](http://127.0.0.1:8787).
 
-The first start creates a runnable **Local product studio** topology. Its built-in demo model is deterministic and offline, so the full lead → builder/reviewer → synthesis loop works immediately.
+The first start creates a runnable **Local product studio** topology: an Orchestrator that can delegate to a Builder, consult an Architect, and request reviews from a Reviewer. It also has a calculator, an on-demand skill, team memory, a project workspace, and a disabled MCP connector. Its built-in demo model is deterministic and offline. If you already have saved state from an earlier version, add the example with the **+** button next to the topology selector.
 
 ## Use the product
 
@@ -52,53 +68,41 @@ The first start creates a runnable **Local product studio** topology. Its built-
 
 1. Add nodes from the library.
 2. Draw **from an agent** to another node to grant access.
-3. Select an agent-to-agent edge to choose delegate, consult, review, report, or handoff.
+3. Select an agent-to-agent edge to choose delegate, consult, review, report, or handoff; the inspector explains what each does at runtime.
 4. Select a storage edge to set read, write, and scope permissions.
-5. Select nodes to edit worker instructions, model endpoints, persistence behavior, and resource settings.
-6. Save the topology. Invalid drafts may be saved, but Work refuses to run them until blocking issues are fixed.
+5. Select an agent to see its **stable context per request** and to set tool exposure, fan-out, and iteration limits. The canvas badge turns amber above 25% of the model window and red above 50%.
+6. Select a connector to discover MCP tools and choose which ones are authorized.
+7. Save the topology. Invalid drafts may be saved, but Work refuses to run them until blocking issues are fixed.
 
-Each MVP agent must have exactly one model edge. At least one agent must be marked **Available in Work**.
+Each agent must have exactly one model edge. At least one agent must be marked **Available in Work**.
 
 ### Work
 
-1. Choose an entry agent in the composer.
-2. Submit a task.
-3. Inspect the structured work orders and live runtime panel.
-4. Pause an active run before changing execution boundaries or worker instructions.
-5. Save the updated topology and resume. Completed orders remain intact; remaining work is checked against the current topology.
+1. Choose an entry agent and submit a task. Select a finished run and keep **Continue thread** checked to follow up; the new run gets a digest of prior work, not its transcript.
+2. **Delegation decisions** show which collaborators were selected and which were skipped.
+3. The **work-order tree** shows ownership, phase, verdicts, revisions, handoffs, and advisory consults. Select an order to see its context per model call.
+4. The run summary shows agents used, model calls, context sent, cache hits, and prefix reuse.
+5. Pause an active run before changing execution boundaries or instructions, save, and resume. Completed orders remain intact; queued work whose relationship was removed is blocked.
 
-When an entry agent has write access to storage and conversation persistence is enabled, the runtime writes `final.md` and `conversation.json` for the run.
+Try: `Calculate 72 * 18, build the implementation plan, and review its risks.`
 
 ## Connect llama.cpp
 
-Start an OpenAI-compatible llama.cpp server. A typical command is:
-
 ```bash
-llama-server -m /absolute/path/to/model.gguf --host 127.0.0.1 --port 8080 --alias specialist
+llama-server -m /absolute/path/to/model.gguf --host 127.0.0.1 --port 8080 --alias specialist --parallel 2
 ```
 
-In Configure, select a Model node and use:
-
-- Provider: `OpenAI compatible`
-- Model ID: `specialist`
-- Base URL: `http://127.0.0.1:8080/v1`
-- Lifecycle: `Externally managed / logical`
-
-Save, then use **Test connection**. Connect the model node to any agent that should be allowed to use it.
-
-llama.cpp currently exposes OpenAI-compatible chat completions, schema-constrained JSON, function calling, parallel slots, and continuous batching. Agentic Harness uses chat completions, optional JSON schema output for delegation planning, tool calls, and usage data when the server returns it.
+In Configure, select a Model node and set Provider `OpenAI compatible`, Model ID `specialist`, Base URL `http://127.0.0.1:8080/v1`, Parallel slots `2`, and Lifecycle `Externally managed / logical`. Save and use **Test connection**.
 
 ## Connect llama-swap
 
-Point the Model node at llama-swap's OpenAI-compatible `/v1` base URL and set:
+Point the Model node at llama-swap's `/v1` base URL, set Lifecycle to `llama-swap managed`, and set the artifact path. **Inspect GGUF** fills in quantization, lineage, and a memory estimate. The **llama-swap** button in Configure generates a `config.yaml` for every managed artifact, including context size, parallel slots, GPU layers, and LoRA adapters.
 
-- Model ID to the configured llama-swap model name
-- Lifecycle to `llama-swap managed`
-- Estimated memory and idle TTL to values appropriate for the artifact
+See [Running local models](docs/RUNNING_LOCAL_MODELS.md).
 
-llama-swap performs physical on-demand loading when the request arrives. Agentic Harness exposes the scheduler's logical state and calls llama-swap's model unload endpoint after the configured idle TTL.
+## Connect MCP servers
 
-See [Running local models](docs/RUNNING_LOCAL_MODELS.md) for configuration details and troubleshooting.
+Add a Connector node, choose Streamable HTTP or a local stdio command, enable it, connect it to the agents that may use it, and click **Discover tools**. See [Connecting MCP servers and APIs](docs/CONNECTORS.md).
 
 ## Local data and environment
 
@@ -106,25 +110,28 @@ By default, state is stored in `.agentic-harness/` under the directory where the
 
 ```text
 .agentic-harness/
-├── state.json
-└── artifacts/
-    └── <run-id>/
-        ├── final.md
-        └── conversation.json
+├── state.json                  topologies, runs, cached connector catalogs
+├── storage/<location>/…        artifact-store nodes (run archives land in the entry agent's scope)
+├── memory/<location>/memory.jsonl
+└── workspace/<location>/…      project-files nodes with a relative location
 ```
 
-Writes use a temporary file followed by an atomic rename.
+Writes use a temporary file followed by an atomic rename. State from earlier versions loads unchanged.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AGENTIC_HARNESS_HOST` | `127.0.0.1` | API/static server bind address |
 | `AGENTIC_HARNESS_PORT` | `8787` | API/static server port |
 | `AGENTIC_HARNESS_DATA_DIR` | `./.agentic-harness` | Durable state directory |
-| `AGENTIC_HARNESS_MEMORY_BUDGET_MB` | 50% of system RAM | Advisory model residency budget |
+| `AGENTIC_HARNESS_WORKSPACE_DIR` | `<data dir>/workspace` | Root for project-files storage with relative locations |
+| `AGENTIC_HARNESS_MEMORY_BUDGET_MB` | 50% of system RAM | Model residency RAM budget |
+| `AGENTIC_HARNESS_VRAM_BUDGET_MB` | 90% of largest GPU | Model residency VRAM budget (unenforced when unknown) |
 | `AGENTIC_HARNESS_MAX_CONCURRENT_RUNS` | `1` | Concurrent run limit, capped at 8 |
+| `AGENTIC_HARNESS_MAX_PARALLEL_ORDERS` | `4` | Work orders that may overlap within one run |
+| `AGENTIC_HARNESS_GPU_TELEMETRY` | on | Set to `off` to skip `nvidia-smi` |
 | `AGENTIC_HARNESS_LOG_LEVEL` | `info` | Fastify log level |
 
-Model API keys are referenced by environment-variable name in the topology. Secret values are never written into topology state.
+Model API keys and connector tokens are referenced by environment-variable name. Secret values are never written into topology state. The server has no authentication and should stay bound to localhost.
 
 ## Verification
 
@@ -134,49 +141,49 @@ pnpm test
 pnpm build
 ```
 
-The test suite covers topology validity, model assignment, hard capability boundaries, safe arithmetic, an end-to-end structured delegation run, durable artifacts, and pause/resume recovery.
+The suite (61 tests) covers topology validity, stable-prefix determinism, deferred exposure at 150 tools, context packing and budget errors, storage scope and symlink enforcement, BM25 memory, HTTP boundary checks, the MCP client over stdio and Streamable HTTP against a real SDK server, an end-to-end deferred MCP run, every relationship semantic (selective delegation, review/revision, handoff, inline consult, reports), thread continuation with memory, pause/resume/restart, scheduler slots and budgets, GGUF parsing, llama-swap config generation, GPU telemetry parsing, and migration of MVP state.
 
 ## Architecture
 
-The runtime is deliberately split into deterministic control software and model-driven worker execution:
-
 ```text
-React Work / Configure UI
+React Work / Configure UI ──── shared: contracts · topology · capabilities · prompt · tokens
            │
            ▼
       Local Fastify API
            │
     ┌──────┴─────────┐
     ▼                ▼
-Topology guard   Durable store
-    │                │
-    ▼                ▼
-Work-order runtime ─ artifacts
+Topology guard   Durable store (state.json, catalogs)
     │
-    ├── deterministic queue + pause/resume
-    ├── model residency pool + memory budget
-    ├── topology-bounded tool registry
-    └── mock or OpenAI-compatible provider
+    ▼
+Work-order runtime ── planner (edge-validated, bounded fan-out)
+    │                 context builder (stable prefix · packing · frames)
+    ├── relationship semantics: delegate · consult · review · handoff · report
+    ├── capability executor ── calculator · storage adapters · MCP (SDK) · HTTP API
+    ├── model pool: slots · RAM/VRAM budgets · eviction · affinity
+    └── providers: OpenAI-compatible · deterministic demo
 ```
 
-The scheduler—not an LLM—owns queueing, legality checks, model state, and recovery. Models plan and execute only inside the exact context derived from their connected edges.
+The scheduler, not an LLM, owns queueing, legality checks, context assembly, model residency, and recovery. See [Architecture](docs/ARCHITECTURE.md) and the decisions in [`docs/architecture`](docs/architecture).
 
-See [MVP architecture](docs/MVP_ARCHITECTURE.md) and the accepted decisions in [`docs/architecture`](docs/architecture).
+## Extension points
 
-## Current extension points
+- Inference providers: `src/server/providers.ts`.
+- Built-in capabilities: `src/shared/capabilities.ts` (descriptor) and `src/server/capability-executor.ts` (execution).
+- Storage adapters: `src/server/storage.ts`, keyed by storage type.
+- Node and edge schemas: `src/shared/contracts.ts`; edge legality: `src/shared/topology.ts`.
+- Context segments and prompt order: `src/shared/prompt.ts` and `src/server/context-builder.ts`.
 
-- Add inference providers behind `src/server/providers.ts`.
-- Register built-in capabilities in `src/server/tools.ts`; definitions are exposed only when the capability node is connected.
-- Extend node schemas in `src/shared/contracts.ts` and legal edge rules in `src/shared/topology.ts`.
-- Add physical storage adapters behind the existing storage edge permission model.
-- Implement MCP discovery/invocation without changing the topology boundary contract.
-- Map internal work orders to an A2A transport when cross-process agents are introduced.
+## Current limits
 
-The MVP intentionally does not autonomously alter topology, execute arbitrary code, manage model downloads, provide a full MCP client, or claim GPU telemetry when the host cannot supply it.
+- Pre-request token counts are estimates; server-reported usage is recorded alongside them.
+- GPU telemetry is NVIDIA-only. `vector-store` has no adapter yet (use `memory`); `git` storage reads and writes files without committing.
+- MCP support covers tools (not resources, prompts, or OAuth). A2A is implemented in-process; no cross-process A2A transport yet.
+- The store is a single JSON document for a single process.
 
 ## Upstream work
 
-The implementation uses React Flow directly and follows integration patterns studied in Langflow, llama.cpp, llama-swap, Open WebUI, MCP, and A2A. No source code from those studied projects is vendored. See [Third-party notices](THIRD_PARTY_NOTICES.md).
+The implementation uses React Flow and the official MCP TypeScript SDK directly, and follows integration patterns studied in Langflow, llama.cpp, llama-swap, Open WebUI, MCP, and A2A. See [Third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## License
 

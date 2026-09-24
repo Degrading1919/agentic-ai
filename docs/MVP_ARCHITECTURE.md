@@ -1,5 +1,7 @@
 # MVP Architecture
 
+> Historical. This describes the first MVP. The current design, including capability exposure, context lifecycle, and relationship semantics, is in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Boundary model
 
 Topology nodes are discriminated typed objects. Edges are directional grants whose source is always an Agent:

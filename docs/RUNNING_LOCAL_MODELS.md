@@ -50,6 +50,41 @@ Agentic Harness will:
 
 The llama-swap server remains the authority on physical process state. Its `/running`, `/logs`, `/metrics`, and UI remain useful for lower-level inspection.
 
+## Custom model artifacts
+
+Each Model node has an **artifact** section for fine-tuned specialists: GGUF path, architecture, base model / lineage, parameter label, quantization, version, GPU layers, and LoRA adapters with scales.
+
+**Inspect GGUF** reads the file's metadata header without loading weights (large arrays such as the tokenizer vocabulary are streamed past). It fills architecture, parameter label, quantization, trained context length, and base model, and it estimates resident memory as:
+
+```text
+weights (file size) + f16 KV cache for the node's context window + ~256 MB overhead
+KV cache = 2 × layers × context × kv_heads × head_dim × 2 bytes
+```
+
+Grouped-query attention (`head_count_kv`) is taken into account. The estimate becomes the node's **Est. RAM MB**. Set **Est. VRAM MB** by hand to match your `-ngl` offload.
+
+## Generate a llama-swap config
+
+With Model nodes set to **llama-swap managed** and an artifact path, the **llama-swap** button in Configure produces a `config.yaml`:
+
+```yaml
+models:
+  runtime-coder:
+    cmd: |
+      llama-server --port ${PORT} -m /models/runtime-coder.Q4_K_M.gguf -c 16384 --parallel 2 --alias runtime-coder -ngl 99 --lora-scaled /models/style.lora.gguf 0.5
+    ttl: 120
+```
+
+The command uses the node's context window, parallel slots, alias, GPU layers, and adapters; `ttl` comes from the idle TTL. Start llama-swap with it and point the Model nodes at llama-swap's `/v1` URL.
+
+## Parallel slots and concurrency
+
+Set **Parallel slots** to match llama.cpp's `--parallel`. The scheduler sends up to that many concurrent requests to one model and queues the rest. Independent work orders that use different models run concurrently only when both fit the RAM and VRAM budgets; otherwise they run one after another with idle models evicted in between. `AGENTIC_HARNESS_MAX_PARALLEL_ORDERS` caps overlap per run.
+
+## Prompt caching
+
+Requests keep a byte-stable prefix per agent (see `docs/ARCHITECTURE.md`), so llama.cpp's prompt cache (`cache_prompt`, on by default) can reuse it across an agent's calls. When the server reports `timings.cache_n` or `usage.prompt_tokens_details.cached_tokens`, Work shows cached tokens per call and a run-level cache hit rate. Running one agent per model slot improves reuse further.
+
 ## API keys
 
 If the endpoint requires a bearer token, put the token in an environment variable before starting Agentic Harness. Store only that variable's name in **API key environment variable** on the Model node.
@@ -65,12 +100,13 @@ The runtime reads the value per request and does not persist it.
 
 ## Memory budgeting
 
-The deterministic model pool uses each Model node's estimated memory to decide whether another model can become resident. It evicts the least-recently-used idle model when needed. If one model exceeds the whole budget, the run fails with an actionable error rather than overcommitting silently.
+The deterministic model pool uses each Model node's estimated RAM and VRAM to decide whether another model can become resident. It evicts the least-recently-used idle model when needed. When nothing can be evicted because other models are busy, the request waits for capacity. If one model exceeds a whole budget, the run fails with an actionable error rather than overcommitting silently.
 
-Set an explicit budget when system RAM is not a useful proxy for the inference device:
+The RAM budget defaults to 50% of system memory. The VRAM budget defaults to 90% of the largest GPU reported by `nvidia-smi`, and is not enforced when no GPU telemetry is available. Override either:
 
 ```powershell
-$env:AGENTIC_HARNESS_MEMORY_BUDGET_MB = "7168"
+$env:AGENTIC_HARNESS_MEMORY_BUDGET_MB = "12288"
+$env:AGENTIC_HARNESS_VRAM_BUDGET_MB = "7168"
 pnpm start
 ```
 
@@ -92,4 +128,8 @@ Pause aborts the in-flight HTTP request and returns that work order to queued st
 
 ### Schema output is unreliable on a small model
 
-The runtime validates requested collaborator IDs against connected edges. Invalid or unparsable plans fall back to a deterministic plan containing only connected collaborators.
+The runtime validates requested collaborator IDs and relationships against connected edges. An unparsable plan falls back to a deterministic plan that picks only collaborators whose role matches the objective, or none. An unparsable review verdict is inferred from its text.
+
+### A run fails with "needs ≈N tokens of stable context"
+
+The agent's configuration alone does not fit the model window. The message names the heaviest segments. Switch the agent to deferred tool exposure, move rarely used skills to on-demand, trim instructions, or use a model with a larger context.

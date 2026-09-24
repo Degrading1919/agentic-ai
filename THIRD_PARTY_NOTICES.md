@@ -12,6 +12,7 @@ Direct runtime dependencies include:
 | Zod | Runtime schema validation | MIT |
 | Lucide | Interface icons | ISC |
 | react-markdown | Safe Markdown rendering | MIT |
+| MCP TypeScript SDK (`@modelcontextprotocol/sdk`) | MCP client (stdio, Streamable HTTP) and the test fixture server | MIT |
 
 Development dependencies include Vite, Vitest, TypeScript, tsx, tsup, and concurrently under their respective open-source licenses.
 
@@ -21,7 +22,8 @@ The following projects were studied for architecture and interoperability patter
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) — local inference, OpenAI-compatible serving, function calling, schema output, and hardware controls
 - [llama-swap](https://github.com/mostlygeek/llama-swap) — model-ID routing, on-demand process lifecycle, TTL eviction, and runtime inspection
 - [Open WebUI](https://github.com/open-webui/open-webui) — local model user experience and provider separation patterns
-- [Model Context Protocol](https://github.com/modelcontextprotocol/modelcontextprotocol) — connector interoperability direction
+- [Model Context Protocol](https://github.com/modelcontextprotocol/modelcontextprotocol) — connector interoperability; the TypeScript SDK is used as a dependency
+- [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) — file layout implemented independently in `src/server/gguf.ts`
 - [Agent2Agent Protocol](https://github.com/a2aproject/A2A) — structured cross-agent interoperability direction
 
 Any future source reuse must be reviewed against the exact upstream version and license, and required notices must be added at that time.
